@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">eSignet Child App</string>
+    <string name="sso_permission_label">Native SSO with eSignet Super App</string>
+    <string name="sso_permission_description">Lets apps from the same vendor sign in using your eSignet session in the Super App.</string>
+</resources>

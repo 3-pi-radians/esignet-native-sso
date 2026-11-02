@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Same definition as the Super App's (same signer), so install order does not matter. -->
+    <permission
+        android:name="io.mosip.nativesso.permission.SSO"
+        android:description="@string/sso_permission_description"
+        android:label="@string/sso_permission_label"
+        android:protectionLevel="signature" />
+
+    <uses-permission android:name="io.mosip.nativesso.permission.SSO" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <queries>
+        <package android:name="io.mosip.nativesso.superapp" />
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.NativeSso">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Redirect for the re-consent (bonus) authorization flow. -->
+        <activity
+            android:name=".CallbackActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:noHistory="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:host="callback" android:scheme="io.mosip.nativesso.childapp" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
