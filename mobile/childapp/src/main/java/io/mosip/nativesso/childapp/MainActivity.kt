@@ -97,14 +97,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderHome(s: org.json.JSONObject) {
-        title("Signed in silently")
+        val viaSso = s.optString("proof_source") == ChildSession.PROOF_SUPER
+        title(if (viaSso) "Signed in silently" else "Signed in")
         text(if (s.optString("proof_source") == ChildSession.PROOF_SUPER)
             "Native SSO: signed in with your Super App session, no UIN or OTP needed."
         else "Signed in after granting additional consent on eSignet.")
         text("Subject: ${s.optString("sub")}")
         text("Scopes: ${s.optString("scope")}")
         text("Authentication: ${s.optString("acr")}")
-        text("Shared session (sid): ${s.optString("sid").take(8)}…")
+        if (s.optString("sid").isNotEmpty()) text("Shared session (sid): ${s.optString("sid").take(8)}…")
         text("Token type: ${s.optString("token_type")} (sender-constrained)")
         val profile = text("")
         button("Load profile (userinfo, DPoP)") {

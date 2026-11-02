@@ -68,7 +68,7 @@ class OAuthClient(
         val now = System.currentTimeMillis() / 1000
         val claims = JSONObject().put("iss", clientId).put("sub", clientId).put("aud", issuer)
             .put("iat", now).put("exp", now + 300).put("jti", Jose.randomB64(16))
-        return clientKey.signJws(JSONObject().put("typ", "JWT"), claims)
+        return clientKey.signJws(JSONObject().put("typ", "JWT").put("kid", clientKey.thumbprint()), claims)
     }
 
     /** Pushes the authorization request bound to [dpopJkt] and returns the browser URL to open. */

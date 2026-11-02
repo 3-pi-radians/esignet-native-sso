@@ -32,7 +32,7 @@ class ChildSession private constructor(private val context: Context) {
     private val pending = SecureStore(context, "child-pending")
     private val sso = SsoClient(context)
     val client = OAuthClient(BuildConfig.ISSUER, BuildConfig.CHILD_CLIENT_ID, clientKey)
-    val clientPublicJwk: JSONObject get() = clientKey.publicJwk().put("use", "sig").put("alg", "RS256")
+    val clientPublicJwk: JSONObject get() = clientKey.clientRegistrationJwk(context)
 
     /** Silent sign-in: fetch id_token + device_secret + DPoP proof from the Super App, then exchange. */
     suspend fun signInWithSso(requested: List<String>): SsoOutcome = try {

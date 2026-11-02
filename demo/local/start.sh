@@ -3,6 +3,7 @@
 #   PostgreSQL (port 5455, data under demo/.run/pg, trust auth: local dev only)
 #   identity-stub (port 8082; local test double for MOSIP mock-identity-system, see its main.go)
 #   esignet-service built from ../esignet with the Native SSO changes (port 8088)
+#   oidc-ui, eSignet's login/consent web UI, Vite dev server (port 3000)
 #
 # Usage: demo/local/start.sh        # start everything, wait for health
 #        demo/local/stop.sh         # stop everything
@@ -18,6 +19,8 @@ mkdir -p "$RUN"
 : "${ESIGNET_PORT:=8088}"
 : "${STUB_ADDR:=127.0.0.1:8082}"
 : "${MOSIP_ESIGNET_HOST:=http://localhost:$ESIGNET_PORT}"
+# hCaptcha's public test site key (always passes; same as eSignet CI). With no
+# MOSIP_ESIGNET_CAPTCHA_VALIDATOR_URL set, eSignet does not validate captcha tokens server-side.
 # Short-lived by default so expiry can be demonstrated; raise for real use.
 : "${MOSIP_ESIGNET_DEVICE_SECRET_EXPIRY_SECONDS:=3600}"
 
@@ -30,7 +33,7 @@ wait_for() { # url, name
   return 1
 }
 
-echo "[1/3] PostgreSQL on :$PG_PORT"
+echo "[1/4] PostgreSQL on :$PG_PORT"
 if [ ! -d "$RUN/pg" ]; then
   initdb -D "$RUN/pg" -U postgres -A trust --locale=en_US.UTF-8 -E UTF8 >"$RUN/initdb.log"
 fi
@@ -44,13 +47,13 @@ if ! psql -h 127.0.0.1 -p "$PG_PORT" -U postgres -lqt | cut -d'|' -f1 | grep -qw
   echo "  schema created"
 fi
 
-echo "[2/3] identity-stub on $STUB_ADDR"
+echo "[2/4] identity-stub on $STUB_ADDR"
 (cd "$ROOT/demo/identity-stub" && go build -o "$RUN/identity-stub" .)
-IDENTITY_STUB_ADDR="$STUB_ADDR" nohup "$RUN/identity-stub" >"$RUN/identity-stub.log" 2>&1 &
+IDENTITY_STUB_ADDR="$STUB_ADDR" nohup "$RUN/identity-stub" </dev/null >"$RUN/identity-stub.log" 2>&1 &
 echo $! >"$RUN/identity-stub.pid"
 wait_for "http://$STUB_ADDR/health" identity-stub
 
-echo "[3/3] esignet-service on :$ESIGNET_PORT"
+echo "[3/4] esignet-service on :$ESIGNET_PORT"
 (cd "$ROOT/esignet/esignet-service" && CGO_ENABLED=0 go build -o "$RUN/esignet" ./cmd/esignet)
 (
   cd "$ROOT/esignet/esignet-service"
@@ -67,9 +70,26 @@ echo "[3/3] esignet-service on :$ESIGNET_PORT"
   MOSIP_ESIGNET_AUTHN_PROVIDER=mock \
   MOSIP_ESIGNET_MOCK_DOMAIN_URL="http://$STUB_ADDR" \
   MOSIP_ESIGNET_DEVICE_SECRET_EXPIRY_SECONDS="$MOSIP_ESIGNET_DEVICE_SECRET_EXPIRY_SECONDS" \
+  MOSIP_ESIGNET_CORS_ALLOWED_ORIGIN_REGEX='^http://localhost:3000$' \
+  MOSIP_ESIGNET_OIDC_UI_HOSTNAME=localhost MOSIP_ESIGNET_OIDC_UI_PORT=3000 MOSIP_ESIGNET_OIDC_UI_SCHEME=http \
+  MOSIP_ESIGNET_CAPTCHA_SITE_PROVIDER=hcaptcha \
+  MOSIP_ESIGNET_CAPTCHA_SITE_KEY=10000000-ffff-ffff-ffff-000000000001 \
   LOG_LEVEL="${LOG_LEVEL:-info}" \
-  nohup "$RUN/esignet" >"$RUN/esignet.log" 2>&1 &
+  nohup "$RUN/esignet" </dev/null >"$RUN/esignet.log" 2>&1 &
   echo $! >"$RUN/esignet.pid"
 )
 wait_for "http://localhost:$ESIGNET_PORT/health" esignet-service
+
+echo "[4/4] oidc-ui (login / consent pages) on :3000"
+if [ "${SKIP_UI:-}" = "" ]; then
+  (cd "$ROOT/esignet/oidc-ui" && [ -d node_modules ] || npm ci --no-audit --no-fund >"$RUN/oidc-ui-install.log" 2>&1)
+  # The UI's dev-mode connectivity check polls <api>/actuator/health, which eSignet Go does not serve
+  # (it has /health, without CORS headers), so the page would show "No Internet Connection". For
+  # this local run, poll a same-origin file instead (stop.sh restores env-config.js).
+  ENV_JS="$ROOT/esignet/oidc-ui/public/env-config.js"
+  grep -q "POLLING_URL" "$ENV_JS" || echo "window._env_.POLLING_URL = '/favicon.ico';" >>"$ENV_JS"
+  (cd "$ROOT/esignet/oidc-ui" && VITE_API_URL="http://localhost:$ESIGNET_PORT" nohup npx vite --port 3000 --strictPort </dev/null \
+    >"$RUN/oidc-ui.log" 2>&1 & echo $! >"$RUN/oidc-ui.pid")
+  wait_for "http://localhost:3000/" oidc-ui
+fi
 echo "Ready. Discovery: $MOSIP_ESIGNET_HOST/.well-known/openid-configuration"

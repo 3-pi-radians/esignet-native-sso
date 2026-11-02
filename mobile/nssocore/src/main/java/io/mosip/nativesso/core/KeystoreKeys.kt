@@ -64,6 +64,17 @@ class KeystoreKey private constructor(private val alias: String, private val ec:
 
     fun delete() = keyStore.deleteEntry(alias)
 
+    /**
+     * Public JWK for registering this key as a private_key_jwt client key (kid = RFC 7638 thumbprint,
+     * the same kid the client assertion header carries). Also written to files/client-jwk.json so the
+     * demo registration script can read it with `adb shell run-as` (public material only).
+     */
+    fun clientRegistrationJwk(context: Context): JSONObject {
+        val jwk = publicJwk().put("kid", thumbprint()).put("use", "sig").put("alg", if (ec) "ES256" else "RS256")
+        java.io.File(context.filesDir, "client-jwk.json").writeText(jwk.toString())
+        return jwk
+    }
+
     companion object {
         private const val ANDROID_KEYSTORE = "AndroidKeyStore"
 

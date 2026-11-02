@@ -31,7 +31,7 @@ class SuperAppSession private constructor(private val context: Context) {
     private val pending = SecureStore(context, "super-pending")
     val client = OAuthClient(BuildConfig.ISSUER, BuildConfig.SUPER_CLIENT_ID, clientKey)
 
-    val clientPublicJwk: JSONObject get() = clientKey.publicJwk().put("use", "sig").put("alg", "RS256")
+    val clientPublicJwk: JSONObject get() = clientKey.clientRegistrationJwk(context)
 
     private fun dpopKey() = KeystoreKey.ec(context, DPOP_KEY_ALIAS)
 
