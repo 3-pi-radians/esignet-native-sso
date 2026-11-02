@@ -94,7 +94,9 @@ type deviceSecretConf struct {
 }
 
 // nativeSSOSession is the server-side record of an authentication session that minted a device
-// secret. Deleting it (e.g. on logout) revokes every device secret of that session.
+// secret, keyed by auth_id (the ID token's sid). Validation requires it, so deleting the record from
+// the runtime store revokes the session's device secret. No logout hook deletes it in this version;
+// it otherwise expires with the device secret.
 type nativeSSOSession struct {
 	Subject  string `json:"sub"`
 	ClientID string `json:"client_id"`
@@ -262,9 +264,11 @@ func (p *deviceSecretProvider) ValidateDeviceSecret(ctx context.Context, request
 	}, nil
 }
 
-// MarkDeviceSecretUsed records that requestingClientID redeemed the device secret. Each client may
-// redeem a given device secret once (the redemption record lives until the secret expires), so a
-// captured exchange cannot be replayed by the same client. Distinct sibling apps may each redeem it.
+// MarkDeviceSecretUsed records that requestingClientID redeemed the device secret (last use, for
+// audit and operations). It never refuses a redemption: a sibling app may sign in again for as long
+// as the device secret and its session are valid, e.g. after signing out or when its own tokens
+// expire. Replaying a captured exchange request is already prevented by the single-use jti of the
+// DPoP proof and of the private_key_jwt client assertion, and by the proof's key binding.
 func (p *deviceSecretProvider) MarkDeviceSecretUsed(ctx context.Context, claims *providers.DeviceSecretClaims,
 	requestingClientID string) error {
 	if claims == nil || claims.JTI == "" || requestingClientID == "" {
@@ -274,13 +278,12 @@ func (p *deviceSecretProvider) MarkDeviceSecretUsed(ctx context.Context, claims 
 	if ttl <= 0 {
 		return providers.ErrDeviceSecretExpired
 	}
-	stored, err := p.store.PutIfNotExists(ctx, nativeSSORedemptionNamespace, claims.JTI+"|"+requestingClientID,
-		[]byte(`{}`), ttl)
+	record, err := json.Marshal(map[string]any{"client_id": requestingClientID, "last_used": p.now().Unix()})
 	if err != nil {
-		return fmt.Errorf("record device secret redemption: %w", err)
+		return fmt.Errorf("marshal device secret redemption: %w", err)
 	}
-	if !stored {
-		return providers.ErrDeviceSecretReplayed
+	if err := p.store.Put(ctx, nativeSSORedemptionNamespace, claims.JTI+"|"+requestingClientID, record, ttl); err != nil {
+		return fmt.Errorf("record device secret redemption: %w", err)
 	}
 	return nil
 }
@@ -372,7 +375,9 @@ func (p *deviceSecretProvider) checkSession(ctx context.Context, payload *device
 }
 
 // checkClientPermitted allows the original client itself, or a client listed in the original
-// client's device_sso_allowed_clients additional_config.
+// client's device_sso_allowed_clients additional_config that belongs to the same relying party. The
+// same-relying-party rule matters because subjects are pairwise per relying party: tokens issued
+// through Native SSO carry the original login's subject, which must not cross relying parties.
 func (p *deviceSecretProvider) checkClientPermitted(ctx context.Context, originalClientID, requestingClientID string) error {
 	if requestingClientID == "" {
 		return providers.ErrDeviceSecretClientNotPermitted
@@ -388,6 +393,16 @@ func (p *deviceSecretProvider) checkClientPermitted(ctx context.Context, origina
 		return nil
 	}
 	if !slices.Contains(DeviceSSOAllowedClients(original.AdditionalConfig), requestingClientID) {
+		return providers.ErrDeviceSecretClientNotPermitted
+	}
+	requesting, err := p.clients.GetActiveClient(ctx, requestingClientID)
+	if err != nil {
+		if errors.Is(err, clientmgmt.ErrClientNotFound) {
+			return providers.ErrDeviceSecretClientNotPermitted
+		}
+		return fmt.Errorf("load requesting client: %w", err)
+	}
+	if requesting.RpID == "" || requesting.RpID != original.RpID {
 		return providers.ErrDeviceSecretClientNotPermitted
 	}
 	return nil

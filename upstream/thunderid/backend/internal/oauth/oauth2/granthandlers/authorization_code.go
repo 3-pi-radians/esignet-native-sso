@@ -102,12 +102,15 @@ func (h *authorizationCodeGrantHandler) HandleGrant(ctx context.Context, tokenRe
 	// Parse authorized scopes
 	authorizedScopes := tokenservice.ParseScopes(authCode.Scopes)
 
-	// OpenID Connect Native SSO: a code carrying device_sso yields a device secret. Check eligibility
-	// before issuing any token so a refused request issues nothing.
+	// OpenID Connect Native SSO: a code carrying device_sso yields a device secret when the request is
+	// still eligible; otherwise the grant continues as an ordinary login without device_sso.
 	deviceSSO := slices.Contains(authorizedScopes, constants.ScopeDeviceSSO)
 	if deviceSSO {
-		if errResp := checkDeviceSSOIssuance(ctx, h.deviceSecretProvider, oauthApp, authorizedScopes); errResp != nil {
-			return nil, errResp
+		if reason := deviceSSOIneligibility(ctx, h.deviceSecretProvider, oauthApp, authorizedScopes); reason != "" {
+			logger.Warn(ctx, "device_sso not honoured; issuing tokens without a device secret",
+				log.String("reason", reason))
+			deviceSSO = false
+			authorizedScopes = withoutScope(authorizedScopes, constants.ScopeDeviceSSO)
 		}
 	}
 

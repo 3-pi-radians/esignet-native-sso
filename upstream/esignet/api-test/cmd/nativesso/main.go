@@ -148,6 +148,7 @@ func (h *harness) run(ctx context.Context) error {
 	rogue := h.newClient("nsso-rogue")
 	super := h.newClient("nsso-super")
 	plain := h.newClient("nsso-plain")
+	foreign := h.newClient("nsso-foreign")
 	nativeCfg := func(extra map[string]any) map[string]any {
 		ac := map[string]any{
 			"require_pushed_authorization_requests": true,
@@ -164,20 +165,25 @@ func (h *harness) run(ctx context.Context) error {
 		grants []string
 		ac     map[string]any
 	}{
-		{super, []string{"authorization_code"}, nativeCfg(map[string]any{
+		{super, []string{"authorization_code", grantTokenExchange}, nativeCfg(map[string]any{
 			"allowed_authorization_scopes": []string{"device_sso"},
-			"device_sso_allowed_clients":   []string{child.id, child2.id},
+			"device_sso_allowed_clients":   []string{child.id, child2.id, foreign.id},
 		})},
 		{child, []string{"authorization_code", grantTokenExchange}, nativeCfg(nil)},
 		{child2, []string{"authorization_code", grantTokenExchange}, nativeCfg(nil)},
 		{rogue, []string{"authorization_code", grantTokenExchange}, nativeCfg(nil)},
 		{plain, []string{"authorization_code"}, nativeCfg(nil)},
+		{foreign, []string{"authorization_code", grantTokenExchange}, nativeCfg(nil)},
 	} {
-		if err := h.register(ctx, reg.c, reg.grants, reg.ac); err != nil {
+		rp := "native-sso-rp"
+		if reg.c == foreign {
+			rp = "another-vendor-rp"
+		}
+		if err := h.register(ctx, reg.c, reg.grants, reg.ac, rp); err != nil {
 			return fmt.Errorf("register %s: %w", reg.c.id, err)
 		}
 	}
-	h.check("client registration", true, "registered super, child, child2, rogue, plain (token-exchange grant and device_sso_allowed_clients accepted)")
+	h.check("client registration", true, "registered super, child, child2, rogue, plain, foreign (token-exchange grant and device_sso_allowed_clients accepted)")
 
 	keyA := newDPoPKey()
 	keyB := newDPoPKey()
@@ -249,6 +255,9 @@ func (h *harness) run(ctx context.Context) error {
 	r = ex(rogue, sup.IDToken, sup.DeviceSecret, "openid email", keyA, nil)
 	h.check("exchange: client outside the vendor family rejected", r.Error == "invalid_grant", "HTTP %d %s: %s", r.Status, r.Error, r.ErrorDesc)
 
+	r = ex(foreign, sup.IDToken, sup.DeviceSecret, "openid email", keyA, nil)
+	h.check("exchange: listed client of another relying party rejected (pairwise sub)", r.Error == "invalid_grant", "HTTP %d %s: %s", r.Status, r.Error, r.ErrorDesc)
+
 	r = ex(plain, sup.IDToken, sup.DeviceSecret, "openid email", keyA, nil)
 	h.check("exchange: client without token-exchange grant rejected", r.Error == "unauthorized_client", "HTTP %d %s", r.Status, r.Error)
 
@@ -276,10 +285,36 @@ func (h *harness) run(ctx context.Context) error {
 	h.check("exchange: child userinfo with another key rejected", st == 401 || st == 400, "HTTP %d", st)
 
 	r = ex(child, sup.IDToken, sup.DeviceSecret, "openid email", keyA, nil)
-	h.check("exchange: replay by the same client rejected", r.Error == "invalid_grant", "HTTP %d %s: %s", r.Status, r.Error, r.ErrorDesc)
+	h.check("exchange: same app may sign in again (e.g. after sign-out)", r.Status == 200 && r.AccessToken != "",
+		"HTTP %d %s %s", r.Status, r.Error, r.ErrorDesc)
+
+	status1, status2, err2 := h.replayExchange(ctx, child, sup.IDToken, sup.DeviceSecret, keyA)
+	// The replay is refused by whichever single-use check runs first (client assertion jti: 401
+	// invalid_client, or DPoP proof jti: 400 invalid_dpop_proof).
+	h.check("exchange: replaying an identical request (same proof and assertion) rejected",
+		status1 == 200 && (status2 == 400 || status2 == 401),
+		"first HTTP %d, replay HTTP %d %s", status1, status2, err2)
+
+	self := ex(super, sup.IDToken, sup.DeviceSecret, "openid email", keyA, nil)
+	h.check("exchange: super app renews its own access token with its device secret",
+		self.Status == 200 && self.AccessToken != "" && cnfJKT(claimsOf(self.AccessToken)) == keyA.jkt,
+		"HTTP %d %s", self.Status, self.Error)
 
 	r = ex(child2, sup.IDToken, sup.DeviceSecret, "openid", keyA, nil)
 	h.check("exchange: second sibling app with a narrower scope", r.Status == 200 && r.Scope == "openid", "HTTP %d scope=%q %s", r.Status, r.Scope, r.Error)
+
+	// The ID token is short-lived (eSignet default 120s); the device secret carries the session.
+	// Wait until the Super App's ID token has expired and sign a sibling in with it.
+	if exp, ok := sidc["exp"].(float64); ok {
+		wait := time.Until(time.Unix(int64(exp), 0)) + 15*time.Second
+		if wait > 0 && wait <= 5*time.Minute && os.Getenv("SKIP_EXPIRY_WAIT") == "" {
+			fmt.Printf("... waiting %s for the super app's id_token to expire\n", wait.Round(time.Second))
+			time.Sleep(wait)
+			r = ex(child2, sup.IDToken, sup.DeviceSecret, "openid email", keyA, nil)
+			h.check("exchange: works after the id_token expired (device secret still valid)",
+				r.Status == 200 && r.AccessToken != "", "HTTP %d %s %s", r.Status, r.Error, r.ErrorDesc)
+		}
+	}
 
 	if logPath := os.Getenv("ESIGNET_LOG"); logPath != "" {
 		logBytes, err := os.ReadFile(logPath)
@@ -307,12 +342,12 @@ func (h *harness) newClient(prefix string) *client {
 	return &client{id: prefix + "-" + h.runID, key: k, kid: prefix + "-key"}
 }
 
-func (h *harness) register(ctx context.Context, c *client, grants []string, ac map[string]any) error {
+func (h *harness) register(ctx context.Context, c *client, grants []string, ac map[string]any, rpID string) error {
 	body, _ := json.Marshal(map[string]any{
 		"requestTime": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 		"request": map[string]any{
 			"clientId": c.id, "clientName": c.id, "clientNameLangMap": map[string]string{"eng": c.id},
-			"relyingPartyId": "native-sso-rp", "logoUri": "https://native-sso.example.org/logo.png",
+			"relyingPartyId": rpID, "logoUri": "https://native-sso.example.org/logo.png",
 			"redirectUris": []string{redirectURI}, "publicKey": rsaJWK(c),
 			"userClaims": []string{"name", "email", "phone_number"}, "authContextRefs": []string{acrOTP},
 			"grantTypes": grants, "clientAuthMethods": []string{"private_key_jwt"}, "additionalConfig": ac,
@@ -396,6 +431,23 @@ func (h *harness) exchange(ctx context.Context, c *client, idToken, deviceSecret
 		mutate(f)
 	}
 	return h.token(ctx, f, key)
+}
+
+// replayExchange sends one exchange request, then the byte-identical request again (same DPoP proof,
+// same client assertion), and returns both statuses and the replay's error code.
+func (h *harness) replayExchange(ctx context.Context, c *client, idToken, deviceSecret string, key *dpopKey) (int, int, string) {
+	f := url.Values{
+		"grant_type": {grantTokenExchange}, "client_id": {c.id},
+		"subject_token": {idToken}, "subject_token_type": {tokenTypeIDToken},
+		"actor_token": {deviceSecret}, "actor_token_type": {tokenTypeDeviceSecret},
+		"audience": {h.d.Issuer}, "scope": {"openid email"},
+		"client_assertion_type": {clientAssertionTypeJWT}, "client_assertion": {h.assertion(c)},
+	}
+	headers := map[string]string{"Content-Type": "application/x-www-form-urlencoded",
+		"DPoP": key.proof("POST", h.d.TokenEndpoint, "")}
+	s1, _, _, _ := h.do(ctx, http.MethodPost, h.d.TokenEndpoint, headers, f.Encode())
+	s2, b2, _, _ := h.do(ctx, http.MethodPost, h.d.TokenEndpoint, headers, f.Encode())
+	return s1, s2, jsonErr(b2)
 }
 
 func (h *harness) token(ctx context.Context, f url.Values, key *dpopKey) tokenResponse {

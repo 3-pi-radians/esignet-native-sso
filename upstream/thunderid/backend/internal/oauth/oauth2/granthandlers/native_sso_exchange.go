@@ -120,6 +120,13 @@ func (h *tokenExchangeGrantHandler) handleNativeSSOGrant(ctx context.Context, to
 		return nil, errResp
 	}
 
+	resp, errResp := h.issueNativeSSOTokens(ctx, tokenRequest, oauthApp, dsClaims, finalScopes, jkt, logger)
+	if errResp != nil {
+		return nil, errResp
+	}
+
+	// Record the redemption only once tokens exist, so a failure while building them never consumes
+	// the device secret. A provider whose policy forbids this redemption still blocks the response.
 	if err := h.deviceSecretProvider.MarkDeviceSecretUsed(ctx, dsClaims, tokenRequest.ClientID); err != nil {
 		if errors.Is(err, providers.ErrDeviceSecretReplayed) {
 			return nil, invalidGrant("The device_secret was already redeemed by this client")
@@ -130,8 +137,7 @@ func (h *tokenExchangeGrantHandler) handleNativeSSOGrant(ctx context.Context, to
 			ErrorDescription: "Failed to process token request",
 		}
 	}
-
-	return h.issueNativeSSOTokens(ctx, tokenRequest, oauthApp, dsClaims, finalScopes, jkt, logger)
+	return resp, nil
 }
 
 // validateDeviceSecret invokes the provider and maps its errors: credential problems become
@@ -165,8 +171,13 @@ func (h *tokenExchangeGrantHandler) validateDeviceSecret(ctx context.Context, cl
 }
 
 // validateNativeSSOIDToken validates the subject_token as an ID token this server issued to the
-// original client: compact JWS (not JWE), typ JWT, not a refresh token, valid signature, issuer,
-// audience and expiry.
+// original client: compact JWS (not JWE), typ JWT, not a refresh token, valid signature, issuer and
+// audience, and not issued in the future.
+//
+// Its exp is deliberately not enforced. The ID token is used like an id_token_hint (OpenID Connect
+// Native SSO 1.0, section 4.1): it identifies the session, while the lifetime of that session is
+// carried by the device secret it is bound to through ds_hash and sid. ID tokens are short-lived
+// (eSignet: minutes), whereas the device secret defines the Native SSO window.
 func (h *tokenExchangeGrantHandler) validateNativeSSOIDToken(ctx context.Context, idToken, originalClientID string,
 	logger *log.Logger) (map[string]interface{}, *model.ErrorResponse) {
 	if strings.Count(idToken, ".") != 2 {
@@ -195,11 +206,17 @@ func (h *tokenExchangeGrantHandler) validateNativeSSOIDToken(ctx context.Context
 			ErrorDescription: "The subject_token is not an ID token",
 		}
 	}
-	if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() >= int64(exp)+h.cfg.JWT.Leeway {
-		return nil, invalidGrant("The subject_token has expired")
+	if svcErr := h.jwtService.VerifyJWTSignature(ctx, idToken); svcErr != nil {
+		logger.Debug(ctx, "Native SSO subject_token signature verification failed", log.String("error", svcErr.Code))
+		return nil, invalidGrant("Invalid subject_token")
 	}
-	if svcErr := h.jwtService.VerifyJWT(ctx, idToken, originalClientID, h.cfg.JWT.Issuer); svcErr != nil {
-		logger.Debug(ctx, "Native SSO subject_token verification failed", log.String("error", svcErr.Code))
+	if iss, _ := claims["iss"].(string); iss != h.cfg.JWT.Issuer {
+		return nil, invalidGrant("Invalid subject_token")
+	}
+	if !audienceContains(claims["aud"], originalClientID) {
+		return nil, invalidGrant("Invalid subject_token")
+	}
+	if iat, ok := claims["iat"].(float64); !ok || int64(iat) > time.Now().Unix()+h.cfg.JWT.Leeway {
 		return nil, invalidGrant("Invalid subject_token")
 	}
 	return claims, nil
@@ -285,7 +302,7 @@ func resolveNativeSSOScopes(requestedScope string, grantedScopes []string,
 func (h *tokenExchangeGrantHandler) issueNativeSSOTokens(ctx context.Context, tokenRequest *model.TokenRequest,
 	oauthApp *providers.OAuthClient, dsClaims *providers.DeviceSecretClaims, scopes []string, jkt string,
 	logger *log.Logger) (*model.TokenResponseDTO, *model.ErrorResponse) {
-	attrs, attributeCacheID := h.reusableAttributes(ctx, dsClaims, scopes, logger)
+	attrs, attributeCacheID := h.reusableAttributes(ctx, tokenRequest.ClientID, dsClaims, scopes, logger)
 
 	userSubConfig := oauthApp.UserAccessTokenConfig()
 	accessToken, err := h.tokenBuilder.BuildAccessToken(ctx, &tokenservice.AccessTokenBuildContext{
@@ -323,13 +340,13 @@ func (h *tokenExchangeGrantHandler) issueNativeSSOTokens(ctx context.Context, to
 	return &model.TokenResponseDTO{AccessToken: *accessToken, IDToken: *idToken}, nil
 }
 
-// reusableAttributes returns the original login's cached user attributes when the second application
-// may receive them. Attributes held as individual claims are filtered per scope downstream, so they
-// are always reusable. An opaque identity-system JWT (providers.RawJWTAttributeKey) cannot be
-// filtered: it is reused only when the second application was granted exactly the original scopes,
-// so a narrower request never receives claims beyond its own scopes.
-func (h *tokenExchangeGrantHandler) reusableAttributes(ctx context.Context, dsClaims *providers.DeviceSecretClaims,
-	scopes []string, logger *log.Logger) (map[string]interface{}, string) {
+// reusableAttributes returns the original login's cached user attributes when the requesting client
+// may receive them. Attributes held as individual claims are filtered per scope and per client
+// downstream, so they are always reusable. An opaque identity-system JWT
+// (providers.RawJWTAttributeKey) cannot be filtered and is addressed to the original client: it is
+// reused only by that same client with exactly the original scopes, and never handed to a sibling.
+func (h *tokenExchangeGrantHandler) reusableAttributes(ctx context.Context, clientID string,
+	dsClaims *providers.DeviceSecretClaims, scopes []string, logger *log.Logger) (map[string]interface{}, string) {
 	if dsClaims.AttributeCacheID == "" || h.attributeCache == nil {
 		return map[string]interface{}{}, ""
 	}
@@ -339,7 +356,8 @@ func (h *tokenExchangeGrantHandler) reusableAttributes(ctx context.Context, dsCl
 		return map[string]interface{}{}, ""
 	}
 	if _, opaque := cached.Attributes[providers.RawJWTAttributeKey]; opaque &&
-		!sameScopeSet(scopes, withoutScope(dsClaims.Scopes, constants.ScopeDeviceSSO)) {
+		(clientID != dsClaims.ClientID ||
+			!sameScopeSet(scopes, withoutScope(dsClaims.Scopes, constants.ScopeDeviceSSO))) {
 		return map[string]interface{}{}, ""
 	}
 	return cached.Attributes, dsClaims.AttributeCacheID
@@ -358,6 +376,21 @@ func sameScopeSet(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// audienceContains reports whether a JWT aud claim (string or array) names clientID.
+func audienceContains(aud interface{}, clientID string) bool {
+	switch v := aud.(type) {
+	case string:
+		return v == clientID
+	case []interface{}:
+		for _, a := range v {
+			if s, _ := a.(string); s == clientID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func invalidGrant(description string) *model.ErrorResponse {

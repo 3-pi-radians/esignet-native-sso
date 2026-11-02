@@ -80,37 +80,29 @@ func consentedClaimNames(scopes []string, claimsRequest *model.ClaimsRequest, sc
 	return names
 }
 
-// checkDeviceSSOIssuance verifies that a device secret may be issued on an authorization_code grant
-// whose code carries the device_sso scope: the server must have a device secret provider, the client
-// must still be registered for device_sso, openid must have been granted, and the token request must
-// carry a verified DPoP proof (the device secret is bound to that key via cnf.jkt).
-func checkDeviceSSOIssuance(ctx context.Context, deviceSecretProvider providers.DeviceSecretProvider,
-	oauthApp *providers.OAuthClient, grantedScopes []string) *model.ErrorResponse {
-	if deviceSecretProvider == nil {
-		return &model.ErrorResponse{
-			Error:            constants.ErrorInvalidScope,
-			ErrorDescription: "The device_sso scope is not supported by this server",
-		}
+// deviceSSOIneligibility explains why a device secret cannot be issued on an authorization_code grant
+// whose code carries the device_sso scope, or returns "" when it can: the server must have a device
+// secret provider, the client must still be registered for device_sso, openid must have been granted,
+// and the token request must carry a verified DPoP proof (the device secret is bound to that key via
+// cnf.jkt).
+//
+// By this point the one-time authorization code is already consumed, so an ineligible request is
+// not failed (that would force the user through the whole login again). The grant proceeds as an
+// ordinary login: no device secret is issued and device_sso is left out of the granted scope, which
+// is how RFC 6749 section 3.3 tells the client a requested scope was not granted.
+func deviceSSOIneligibility(ctx context.Context, deviceSecretProvider providers.DeviceSecretProvider,
+	oauthApp *providers.OAuthClient, grantedScopes []string) string {
+	switch {
+	case deviceSecretProvider == nil:
+		return "no device secret provider is configured"
+	case oauthApp == nil || !slices.Contains(oauthApp.Scopes, constants.ScopeDeviceSSO):
+		return "the client is not registered for device_sso"
+	case !slices.Contains(grantedScopes, constants.ScopeOpenID):
+		return "openid was not granted"
+	case dpop.GetJkt(ctx) == "":
+		return "the token request carried no DPoP proof"
 	}
-	if oauthApp == nil || !slices.Contains(oauthApp.Scopes, constants.ScopeDeviceSSO) {
-		return &model.ErrorResponse{
-			Error:            constants.ErrorInvalidScope,
-			ErrorDescription: "The client is not authorized for the device_sso scope",
-		}
-	}
-	if !slices.Contains(grantedScopes, constants.ScopeOpenID) {
-		return &model.ErrorResponse{
-			Error:            constants.ErrorInvalidScope,
-			ErrorDescription: "The device_sso scope requires the openid scope",
-		}
-	}
-	if dpop.GetJkt(ctx) == "" {
-		return &model.ErrorResponse{
-			Error:            constants.ErrorInvalidDPoPProof,
-			ErrorDescription: "A DPoP proof is required to obtain a device_secret",
-		}
-	}
-	return nil
+	return ""
 }
 
 // issueDeviceSecret mints a device secret for the authorization_code grant and returns it together

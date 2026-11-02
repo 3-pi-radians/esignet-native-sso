@@ -160,12 +160,12 @@ func (ts *DeviceSecretProviderTestSuite) SetupTest() {
 	ts.signer = newFakeSigner()
 	ts.encrypter = newFakeEncrypter()
 	ts.clients = fakeDeviceSecretClients{
-		dsTestSuper: {ClientID: dsTestSuper, AdditionalConfig: map[string]any{
-			DeviceSSOAllowedClientsKey: []any{dsTestChild},
+		dsTestSuper: {ClientID: dsTestSuper, RpID: "vendor-rp", AdditionalConfig: map[string]any{
+			DeviceSSOAllowedClientsKey: []any{dsTestChild, "foreign-app"},
 		}},
-		dsTestChild:  {ClientID: dsTestChild},
-		"other-app":  {ClientID: "other-app"},
-		"lonely-app": {ClientID: "lonely-app"},
+		dsTestChild:   {ClientID: dsTestChild, RpID: "vendor-rp"},
+		"other-app":   {ClientID: "other-app", RpID: "vendor-rp"},
+		"foreign-app": {ClientID: "foreign-app", RpID: "another-rp"},
 	}
 	ts.store = inmemory.Initialize("test")
 	ts.now = time.Now()
@@ -404,15 +404,22 @@ func (ts *DeviceSecretProviderTestSuite) TestValidate_InfrastructureFailureIsNot
 	ts.False(errors.Is(err, providers.ErrDeviceSecretInvalid))
 }
 
-func (ts *DeviceSecretProviderTestSuite) TestMarkUsed_OncePerClient() {
+func (ts *DeviceSecretProviderTestSuite) TestMarkUsed_RecordsAndAllowsRepeatSignIn() {
 	claims, err := ts.provider.ValidateDeviceSecret(context.Background(), dsTestChild, ts.generate())
 	ts.Require().NoError(err)
 
 	ts.NoError(ts.provider.MarkDeviceSecretUsed(context.Background(), claims, dsTestChild))
-	ts.ErrorIs(ts.provider.MarkDeviceSecretUsed(context.Background(), claims, dsTestChild),
-		providers.ErrDeviceSecretReplayed)
-	ts.NoError(ts.provider.MarkDeviceSecretUsed(context.Background(), claims, "another-child"),
-		"a different sibling app may redeem the same device secret")
+	ts.NoError(ts.provider.MarkDeviceSecretUsed(context.Background(), claims, dsTestChild),
+		"a sibling app may sign in again while the device secret is valid")
+	raw, err := ts.store.Get(context.Background(), nativeSSORedemptionNamespace, claims.JTI+"|"+dsTestChild)
+	ts.Require().NoError(err)
+	ts.Contains(string(raw), dsTestChild)
+}
+
+func (ts *DeviceSecretProviderTestSuite) TestValidate_ListedClientOfAnotherRelyingPartyIsNotPermitted() {
+	ts.clients["foreign-app"] = clientmgmt.ClientResponse{ClientID: "foreign-app", RpID: "another-rp"}
+	_, err := ts.provider.ValidateDeviceSecret(context.Background(), "foreign-app", ts.generate())
+	ts.ErrorIs(err, providers.ErrDeviceSecretClientNotPermitted)
 }
 
 func (ts *DeviceSecretProviderTestSuite) TestMarkUsed_ExpiredOrIncomplete() {

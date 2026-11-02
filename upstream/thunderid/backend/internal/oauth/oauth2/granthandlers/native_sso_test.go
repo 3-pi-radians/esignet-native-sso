@@ -177,7 +177,7 @@ func (s *NativeSSOTestSuite) expectValidDeviceSecret() {
 }
 
 func (s *NativeSSOTestSuite) expectValidIDTokenSignature(idToken string) {
-	s.mockJWTService.On("VerifyJWT", mock.Anything, idToken, nssoSuperClientID, nssoIssuer).
+	s.mockJWTService.On("VerifyJWTSignature", mock.Anything, idToken).
 		Return((*tidcommon.ServiceError)(nil)).Once()
 }
 
@@ -336,30 +336,33 @@ func (s *NativeSSOTestSuite) TestAuthorizationCode_WithoutDeviceSSO_IsUnchanged(
 	s.mockDeviceSecret.AssertNotCalled(s.T(), "GenerateDeviceSecret", mock.Anything, mock.Anything)
 }
 
-func (s *NativeSSOTestSuite) TestAuthorizationCode_DeviceSSO_Rejections() {
+// The authorization code is already consumed when device_sso eligibility is known, so an ineligible
+// request is not failed: it completes as an ordinary login, without a device secret and without
+// device_sso in the granted scope.
+func (s *NativeSSOTestSuite) TestAuthorizationCode_DeviceSSO_IneligibleDegradesToOrdinaryLogin() {
 	cases := []struct {
 		name     string
 		scopes   string
 		app      func() *providers.OAuthClient
 		provider bool
 		ctx      context.Context
-		wantErr  string
 	}{
 		{"client not registered for device_sso", "openid email device_sso", func() *providers.OAuthClient {
 			app := *s.superApp
 			app.Scopes = []string{"email"}
 			return &app
-		}, true, dpopCtx(nssoJKT), constants.ErrorInvalidScope},
+		}, true, dpopCtx(nssoJKT)},
 		{"server without provider", "openid email device_sso", func() *providers.OAuthClient { return s.superApp },
-			false, dpopCtx(nssoJKT), constants.ErrorInvalidScope},
+			false, dpopCtx(nssoJKT)},
 		{"device_sso without openid", "email device_sso", func() *providers.OAuthClient { return s.superApp },
-			true, dpopCtx(nssoJKT), constants.ErrorInvalidScope},
+			true, dpopCtx(nssoJKT)},
 		{"no DPoP proof", "openid email device_sso", func() *providers.OAuthClient { return s.superApp },
-			true, context.Background(), constants.ErrorInvalidDPoPProof},
+			true, context.Background()},
 	}
 	for _, tc := range cases {
 		s.Run(tc.name, func() {
 			code := s.authCode(tc.scopes)
+			code.AttributeCacheID = ""
 			if tc.ctx == context.Background() {
 				code.DPoPJkt = ""
 			}
@@ -367,17 +370,26 @@ func (s *NativeSSOTestSuite) TestAuthorizationCode_DeviceSSO_Rejections() {
 			authzSvc.On("GetAuthorizationCodeDetails", mock.Anything, nssoSuperClientID, "code-1").
 				Return(code, nil).Once()
 			builder := tokenservicemock.NewTokenBuilderInterfaceMock(s.T())
+			var grantedScopes []string
+			builder.On("BuildAccessToken", mock.Anything, mock.MatchedBy(
+				func(c *tokenservice.AccessTokenBuildContext) bool { grantedScopes = c.Scopes; return true })).
+				Return(&model.TokenDTO{Token: "at"}, nil).Once()
+			builder.On("BuildIDToken", mock.Anything, mock.MatchedBy(
+				func(c *tokenservice.IDTokenBuildContext) bool { return c.SessionID == "" && c.DeviceSecretHash == "" })).
+				Return(&model.TokenDTO{Token: "idt"}, nil).Maybe()
+			deviceSecret := devicesecretprovidermock.NewDeviceSecretProviderMock(s.T())
 			h := &authorizationCodeGrantHandler{authzService: authzSvc, tokenBuilder: builder,
 				attributeCache: s.mockAttrCache, resourceService: s.mockResource}
 			if tc.provider {
-				h.deviceSecretProvider = s.mockDeviceSecret
+				h.deviceSecretProvider = deviceSecret
 			}
 
 			resp, errResp := h.HandleGrant(tc.ctx, s.codeRequest(), tc.app())
 
-			s.Nil(resp)
-			s.assertError(errResp, tc.wantErr)
-			builder.AssertNotCalled(s.T(), "BuildAccessToken", mock.Anything, mock.Anything)
+			s.Require().Nil(errResp)
+			s.Empty(resp.DeviceSecret)
+			s.NotContains(grantedScopes, constants.ScopeDeviceSSO)
+			deviceSecret.AssertNotCalled(s.T(), "GenerateDeviceSecret", mock.Anything, mock.Anything)
 		})
 	}
 }
@@ -608,24 +620,33 @@ func (s *NativeSSOTestSuite) TestNativeSSO_IDTokenBindingFailures() {
 }
 
 func (s *NativeSSOTestSuite) TestNativeSSO_IDTokenValidationFailures() {
-	s.Run("invalid signature or issuer", func() {
+	s.Run("invalid signature", func() {
 		idToken := fakeIDToken("JWT", s.superIDTokenClaims())
 		s.expectValidDeviceSecret()
-		s.mockJWTService.On("VerifyJWT", mock.Anything, idToken, nssoSuperClientID, nssoIssuer).
+		s.mockJWTService.On("VerifyJWTSignature", mock.Anything, idToken).
 			Return(&tidcommon.ServiceError{Code: "JWT-1001"}).Once()
 		_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
 			s.exchangeRequest(idToken, "openid"), s.childApp)
 		s.assertError(errResp, constants.ErrorInvalidGrant)
 	})
-	s.Run("expired", func() {
-		claims := s.superIDTokenClaims()
-		claims["exp"] = float64(time.Now().Add(-time.Minute).Unix())
-		s.expectValidDeviceSecret()
-		_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
-			s.exchangeRequest(fakeIDToken("JWT", claims), "openid"), s.childApp)
-		s.assertError(errResp, constants.ErrorInvalidGrant)
-		s.Contains(errResp.ErrorDescription, "expired")
-	})
+	for name, mutate := range map[string]func(map[string]interface{}){
+		"wrong issuer":      func(c map[string]interface{}) { c["iss"] = "https://attacker.example.com" },
+		"wrong audience":    func(c map[string]interface{}) { c["aud"] = nssoChildClientID },
+		"missing audience":  func(c map[string]interface{}) { delete(c, "aud") },
+		"issued in future":  func(c map[string]interface{}) { c["iat"] = float64(time.Now().Add(time.Hour).Unix()) },
+		"missing issued-at": func(c map[string]interface{}) { delete(c, "iat") },
+	} {
+		s.Run(name, func() {
+			claims := s.superIDTokenClaims()
+			mutate(claims)
+			idToken := fakeIDToken("JWT", claims)
+			s.expectValidDeviceSecret()
+			s.expectValidIDTokenSignature(idToken)
+			_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
+				s.exchangeRequest(idToken, "openid"), s.childApp)
+			s.assertError(errResp, constants.ErrorInvalidGrant)
+		})
+	}
 	s.Run("encrypted (JWE) ID token", func() {
 		s.expectValidDeviceSecret()
 		_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
@@ -652,6 +673,25 @@ func (s *NativeSSOTestSuite) TestNativeSSO_IDTokenValidationFailures() {
 			s.exchangeRequest("!!.@@.##", "openid"), s.childApp)
 		s.assertError(errResp, constants.ErrorInvalidRequest)
 	})
+}
+
+// The ID token is short-lived; the session lifetime is carried by the device secret, so an expired
+// but otherwise valid ID token still signs the sibling app in.
+func (s *NativeSSOTestSuite) TestNativeSSO_ExpiredIDTokenAcceptedWhileDeviceSecretValid() {
+	claims := s.superIDTokenClaims()
+	claims["iat"] = float64(time.Now().Add(-3 * time.Hour).Unix())
+	claims["exp"] = float64(time.Now().Add(-3*time.Hour + 2*time.Minute).Unix())
+	idToken := fakeIDToken("JWT", claims)
+	s.expectValidDeviceSecret()
+	s.expectValidIDTokenSignature(idToken)
+	s.expectOriginalClientDeviceSSO()
+	s.expectIssuance()
+
+	resp, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT), s.exchangeRequest(idToken, "openid email"),
+		s.childApp)
+
+	s.Require().Nil(errResp)
+	s.Equal("child-at", resp.AccessToken.Token)
 }
 
 func (s *NativeSSOTestSuite) TestNativeSSO_OriginalClientLostDeviceSSO() {
@@ -682,19 +722,44 @@ func (s *NativeSSOTestSuite) TestNativeSSO_OriginalClientLookupServerError() {
 	s.assertError(errResp, constants.ErrorServerError)
 }
 
-func (s *NativeSSOTestSuite) TestNativeSSO_Replay() {
+// A provider may refuse a redemption (ErrDeviceSecretReplayed); the redemption is only recorded
+// after tokens are built, and a refusal still withholds them.
+func (s *NativeSSOTestSuite) TestNativeSSO_ProviderRefusesRedemption() {
 	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
 	s.expectValidDeviceSecret()
 	s.expectValidIDTokenSignature(idToken)
 	s.expectOriginalClientDeviceSSO()
+	s.mockAttrCache.On("GetAttributeCache", mock.Anything, nssoCacheID).
+		Return(&attributecache.AttributeCache{ID: nssoCacheID, Attributes: map[string]interface{}{}},
+			(*tidcommon.ServiceError)(nil)).Once()
+	s.mockTokenBuilder.On("BuildAccessToken", mock.Anything, mock.Anything).Return(&model.TokenDTO{Token: "at"}, nil).Once()
+	s.mockTokenBuilder.On("BuildIDToken", mock.Anything, mock.Anything).Return(&model.TokenDTO{Token: "idt"}, nil).Once()
 	s.mockDeviceSecret.On("MarkDeviceSecretUsed", mock.Anything, s.dsClaims, nssoChildClientID).
 		Return(providers.ErrDeviceSecretReplayed).Once()
+
+	resp, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT), s.exchangeRequest(idToken, "openid"),
+		s.childApp)
+
+	s.Nil(resp)
+	s.assertError(errResp, constants.ErrorInvalidGrant)
+}
+
+// A failure while building tokens must not record (and so must not consume) the redemption.
+func (s *NativeSSOTestSuite) TestNativeSSO_TokenBuildFailureDoesNotRecordRedemption() {
+	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
+	s.expectValidDeviceSecret()
+	s.expectValidIDTokenSignature(idToken)
+	s.expectOriginalClientDeviceSSO()
+	s.mockAttrCache.On("GetAttributeCache", mock.Anything, nssoCacheID).
+		Return(&attributecache.AttributeCache{ID: nssoCacheID, Attributes: map[string]interface{}{}},
+			(*tidcommon.ServiceError)(nil)).Once()
+	s.mockTokenBuilder.On("BuildAccessToken", mock.Anything, mock.Anything).Return(nil, errors.New("sign failed")).Once()
 
 	_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT), s.exchangeRequest(idToken, "openid"),
 		s.childApp)
 
-	s.assertError(errResp, constants.ErrorInvalidGrant)
-	s.mockTokenBuilder.AssertNotCalled(s.T(), "BuildAccessToken", mock.Anything, mock.Anything)
+	s.assertError(errResp, constants.ErrorServerError)
+	s.mockDeviceSecret.AssertNotCalled(s.T(), "MarkDeviceSecretUsed", mock.Anything, mock.Anything, mock.Anything)
 }
 
 func (s *NativeSSOTestSuite) TestNativeSSO_NotSupportedWithoutProvider() {
@@ -729,24 +794,33 @@ func (s *NativeSSOTestSuite) TestConsentedClaimNames() {
 	s.Equal([]string{"birthdate", "email", "gender", "phone_number", "sub"}, got)
 }
 
-// An opaque identity-system JWT cannot be filtered per scope, so a narrower second application must
-// not inherit it; an identical scope set may.
-func (s *NativeSSOTestSuite) TestNativeSSO_OpaqueAttributesOnlyForIdenticalScopes() {
+// An opaque identity-system JWT cannot be filtered per scope and is addressed to the original client:
+// a sibling app never receives it; the original client renewing its own session with the same scopes
+// may.
+func (s *NativeSSOTestSuite) TestNativeSSO_OpaqueAttributesNeverReachSiblings() {
 	for _, tc := range []struct {
-		scope   string
-		wantACI string
+		name     string
+		clientID string
+		scope    string
+		wantACI  string
 	}{
-		{"openid", ""},
-		{"openid email", nssoCacheID},
+		{"sibling, same scopes", nssoChildClientID, "openid email", ""},
+		{"sibling, narrower scopes", nssoChildClientID, "openid", ""},
+		{"original client, same scopes", nssoSuperClientID, "openid email", nssoCacheID},
+		{"original client, narrower scopes", nssoSuperClientID, "openid", ""},
 	} {
-		s.Run(tc.scope, func() {
+		s.Run(tc.name, func() {
 			s.SetupTest()
+			app := s.childApp
+			if tc.clientID == nssoSuperClientID {
+				app = s.superApp
+			}
 			idToken := fakeIDToken("JWT", s.superIDTokenClaims())
-			s.expectValidDeviceSecret()
+			s.mockDeviceSecret.On("ValidateDeviceSecret", mock.Anything, tc.clientID, nssoDeviceSecret).
+				Return(s.dsClaims, nil).Once()
 			s.expectValidIDTokenSignature(idToken)
 			s.expectOriginalClientDeviceSSO()
-			s.mockDeviceSecret.On("MarkDeviceSecretUsed", mock.Anything, s.dsClaims, nssoChildClientID).
-				Return(nil).Once()
+			s.mockDeviceSecret.On("MarkDeviceSecretUsed", mock.Anything, s.dsClaims, tc.clientID).Return(nil).Once()
 			s.mockAttrCache.On("GetAttributeCache", mock.Anything, nssoCacheID).
 				Return(&attributecache.AttributeCache{ID: nssoCacheID, Attributes: map[string]interface{}{
 					providers.RawJWTAttributeKey: "kyc.jwt.sig"}}, (*tidcommon.ServiceError)(nil)).Once()
@@ -757,8 +831,9 @@ func (s *NativeSSOTestSuite) TestNativeSSO_OpaqueAttributesOnlyForIdenticalScope
 			s.mockTokenBuilder.On("BuildIDToken", mock.Anything, mock.Anything).
 				Return(&model.TokenDTO{Token: "idt"}, nil).Once()
 
-			_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
-				s.exchangeRequest(idToken, tc.scope), s.childApp)
+			req := s.exchangeRequest(idToken, tc.scope)
+			req.ClientID = tc.clientID
+			_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT), req, app)
 
 			s.Require().Nil(errResp)
 			s.Equal(tc.wantACI, gotACI)
