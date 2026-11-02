@@ -18,7 +18,6 @@ object SsoContract {
     const val KEY_ERROR = "error"
 
     const val ERROR_NOT_SIGNED_IN = "not_signed_in"
-    const val ERROR_SESSION_EXPIRED = "session_expired"
     const val ERROR_CALLER_NOT_TRUSTED = "caller_not_trusted"
     const val ERROR_TARGET_NOT_ALLOWED = "target_not_allowed"
     const val ERROR_INTERNAL = "internal_error"

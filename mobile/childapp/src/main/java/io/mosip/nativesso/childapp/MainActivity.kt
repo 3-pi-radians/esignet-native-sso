@@ -20,10 +20,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** Child App: "Sign in" uses Native SSO through the Super App; no UIN/OTP entry when it succeeds. */
+/**
+ * Child App: "Sign in" uses Native SSO through the Super App; no UIN/OTP entry when it succeeds.
+ * Keystore and encrypted storage work always runs off the main thread.
+ */
 class MainActivity : AppCompatActivity() {
     private lateinit var root: LinearLayout
-    private val session by lazy { ChildSession.get(this) }
+    private val session get() = ChildSession.get(this)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -37,18 +40,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun render(message: String? = null) {
-        root.removeAllViews()
-        val s = session.activeSession()
-        if (s == null) renderLogin(message) else renderHome(s)
+        lifecycleScope.launch {
+            val (active, jwk) = withContext(Dispatchers.IO) {
+                val s = session.activeSession()
+                s to (if (s == null) session.clientPublicJwk.toString() else "")
+            }
+            root.removeAllViews()
+            if (active == null) renderLogin(message, jwk) else renderHome(active)
+        }
     }
 
-    private fun renderLogin(message: String?) {
+    private fun renderLogin(message: String?, jwk: String) {
         title("eSignet Child App")
         message?.let { text(it).apply { setTextColor(0xFFB3261E.toInt()) } }
         button("Sign in") { signIn(listOf("openid", "email")) }
         button("Sign in (also request phone)") { signIn(listOf("openid", "email", "phone")) }
         text("\nClient setup (register this public key for ${BuildConfig.CHILD_CLIENT_ID}):", bold = true)
-        val jwk = session.clientPublicJwk.toString()
         text(jwk).apply { typeface = Typeface.MONOSPACE; textSize = 11f }
         button("Copy public JWK") {
             (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("client-jwk", jwk))
@@ -109,7 +116,12 @@ class MainActivity : AppCompatActivity() {
                 }, { "userinfo failed: ${it.message}" })
             }
         }
-        button("Sign out") { session.logout(); render() }
+        button("Sign out") {
+            lifecycleScope.launch {
+                withContext(Dispatchers.IO) { session.logout() }
+                render()
+            }
+        }
     }
 
     private fun title(t: String) = text(t, bold = true).apply { textSize = 22f }

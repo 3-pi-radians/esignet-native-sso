@@ -21,8 +21,7 @@ class SsoSigningService : Service() {
     private val binder = object : ISsoSigningService.Stub() {
         override fun getSsoArtifacts(): Bundle = guarded { caller ->
             val session = SuperAppSession.get(this@SsoSigningService)
-            val active = session.activeSession() ?: return@guarded failure(
-                if (session.hasExpiredSession()) SsoContract.ERROR_SESSION_EXPIRED else SsoContract.ERROR_NOT_SIGNED_IN)
+            val active = session.activeSession() ?: return@guarded failure(SsoContract.ERROR_NOT_SIGNED_IN)
             val deviceSecret = active.optString("device_secret")
             if (deviceSecret.isEmpty()) return@guarded failure(SsoContract.ERROR_NOT_SIGNED_IN)
             val tokenEndpoint = session.client.discovery().tokenEndpoint

@@ -4,8 +4,11 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import org.json.JSONObject
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import java.io.File
 import java.security.KeyStore
+import java.security.UnrecoverableKeyException
+import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -15,12 +18,15 @@ import javax.crypto.spec.GCMParameterSpec
  * Stores a small JSON document encrypted with AES-256-GCM under a non-exportable Android Keystore
  * key, in the app's private files directory. Tokens and the device secret are never written in
  * plaintext (no SharedPreferences, no external storage).
+ *
+ * All operations are serialized on one process-wide lock: the Super App reads its store from binder
+ * threads (sibling apps) while the UI or a callback may be writing it.
  */
 class SecureStore(context: Context, name: String) {
     private val file = File(context.filesDir, "$name.enc")
     private val alias = "nsso-store-$name"
 
-    fun write(doc: JSONObject) {
+    fun write(doc: JSONObject) = synchronized(LOCK) {
         val cipher = Cipher.getInstance(TRANSFORMATION).apply { init(Cipher.ENCRYPT_MODE, key()) }
         val ct = cipher.doFinal(doc.toString().toByteArray(Charsets.UTF_8))
         val tmp = File(file.parentFile, file.name + ".tmp")
@@ -28,8 +34,12 @@ class SecureStore(context: Context, name: String) {
         if (!tmp.renameTo(file)) throw IllegalStateException("could not persist secure store")
     }
 
-    /** Returns the stored document, or null when absent or unreadable (e.g. key invalidated). */
-    fun read(): JSONObject? {
+    /**
+     * Returns the stored document, or null when absent. The store is erased only when its key is
+     * permanently unusable or the ciphertext fails authentication; any other (possibly transient)
+     * Keystore error returns null and keeps the data, so a hiccup never logs the user out.
+     */
+    fun read(): JSONObject? = synchronized(LOCK) {
         if (!file.exists()) return null
         return try {
             val bytes = file.readBytes()
@@ -38,13 +48,18 @@ class SecureStore(context: Context, name: String) {
             val cipher = Cipher.getInstance(TRANSFORMATION)
                 .apply { init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, iv)) }
             JSONObject(String(cipher.doFinal(bytes.copyOfRange(1 + ivLen, bytes.size)), Charsets.UTF_8))
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            clear(); null
+        } catch (e: UnrecoverableKeyException) {
+            clear(); null
+        } catch (e: AEADBadTagException) {
+            clear(); null
         } catch (e: Exception) {
-            clear()
             null
         }
     }
 
-    fun clear() {
+    fun clear() = synchronized(LOCK) {
         file.delete()
         KeyStore.getInstance(KEYSTORE).apply { load(null) }.deleteEntry(alias)
     }
@@ -66,5 +81,6 @@ class SecureStore(context: Context, name: String) {
     private companion object {
         const val KEYSTORE = "AndroidKeyStore"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
+        val LOCK = Any()
     }
 }

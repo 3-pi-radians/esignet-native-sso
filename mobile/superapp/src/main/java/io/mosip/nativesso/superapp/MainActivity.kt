@@ -19,13 +19,16 @@ import io.mosip.nativesso.core.Jose
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.text.DateFormat
 import java.util.Date
 
-/** Login screen ("Sign in with eSignet") and home screen of the Super App. */
+/**
+ * Login screen ("Sign in with eSignet") and home screen of the Super App. Keystore and encrypted
+ * storage work (key generation, decryption) always runs off the main thread.
+ */
 class MainActivity : AppCompatActivity() {
     private lateinit var root: LinearLayout
-    private val session by lazy { SuperAppSession.get(this) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -35,50 +38,76 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        render()
+        refresh()
     }
 
-    private fun render() {
-        root.removeAllViews()
-        val active = session.activeSession()
-        if (active == null) renderLogin(session.hasExpiredSession()) else renderHome(active)
+    private fun refresh(message: String? = null) {
+        lifecycleScope.launch {
+            val state = withContext(Dispatchers.IO) {
+                val session = SuperAppSession.get(this@MainActivity)
+                val active = session.activeSession()
+                if (active != null) ScreenState(active, null, null)
+                else ScreenState(null, session.clientPublicJwk.toString(), AppIdentity.signerFingerprint(this@MainActivity))
+            }
+            root.removeAllViews()
+            if (state.session == null) renderLogin(state, message) else renderHome(state.session)
+        }
     }
 
-    private fun renderLogin(expired: Boolean) {
+    private data class ScreenState(val session: JSONObject?, val clientJwk: String?, val signerFingerprint: String?)
+
+    private fun renderLogin(state: ScreenState, message: String?) {
         title("eSignet Super App")
-        if (expired) text("Your session has expired. Sign in again to keep sibling apps signed in.")
+        message?.let { text(it).apply { setTextColor(0xFFB3261E.toInt()) } }
         button("Sign in with eSignet") {
             lifecycleScope.launch {
-                val url = withContext(Dispatchers.IO) { runCatching { session.startLogin(SuperAppSession.LOGIN_SCOPE) } }
+                val url = withContext(Dispatchers.IO) {
+                    runCatching { SuperAppSession.get(this@MainActivity).startLogin(SuperAppSession.LOGIN_SCOPE) }
+                }
                 url.onSuccess { CustomTabsIntent.Builder().build().launchUrl(this@MainActivity, Uri.parse(it)) }
-                    .onFailure { text("Could not start sign-in: ${it.message}") }
+                    .onFailure { refresh("Could not start sign-in: ${it.message}") }
             }
         }
         text("\nClient setup (register this public key for ${BuildConfig.SUPER_CLIENT_ID}):", bold = true)
-        val jwk = session.clientPublicJwk.toString()
-        mono(jwk)
-        button("Copy public JWK") { copy("client-jwk", jwk) }
-        text("Signing certificate SHA-256:\n${AppIdentity.signerFingerprint(this)}")
+        val jwk = state.clientJwk.orEmpty()
+        text(jwk).apply { typeface = Typeface.MONOSPACE; textSize = 11f }
+        button("Copy public JWK") {
+            (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("client-jwk", jwk))
+        }
+        text("Signing certificate SHA-256:\n${state.signerFingerprint}")
     }
 
-    private fun renderHome(s: org.json.JSONObject) {
+    private fun renderHome(s: JSONObject) {
         title("Signed in")
         text("Subject: ${s.optString("sub")}")
         text("Scopes: ${s.optString("scope")}")
         text("Authentication: ${s.optString("acr")}")
         text("Session id (sid): ${s.optString("sid").take(8)}…")
-        text("Native SSO: " + if (s.optString("device_secret").isNotEmpty()) "enabled (device_secret held securely)" else "not enabled")
-        text("Session valid until: ${DateFormat.getDateTimeInstance().format(Date(s.optLong("id_token_exp") * 1000))}")
+        text("Native SSO: " + if (s.optString("device_secret").isNotEmpty())
+            "enabled (device_secret held encrypted; sibling apps can sign in)" else "not enabled")
+        text("Signed in at: ${DateFormat.getDateTimeInstance().format(Date(s.optLong("signed_in_at") * 1000))}")
         val profile = text("")
         button("Load profile (userinfo, DPoP)") {
             lifecycleScope.launch {
                 val r = withContext(Dispatchers.IO) {
-                    runCatching { session.client.userinfo(s.getString("access_token"), session.proofs) }
+                    runCatching {
+                        val session = SuperAppSession.get(this@MainActivity)
+                        val at = session.renewAccessToken() ?: return@runCatching null
+                        session.client.userinfo(at, session.proofs)
+                    }
                 }
-                profile.text = r.fold({ (status, body) -> "userinfo HTTP $status\n" + describe(body) }, { "userinfo failed: ${it.message}" })
+                r.fold({ res ->
+                    if (res == null) refresh("Your eSignet session has ended. Sign in again.")
+                    else profile.text = "userinfo HTTP ${res.first}\n" + describe(res.second)
+                }, { profile.text = "userinfo failed: ${it.message}" })
             }
         }
-        button("Sign out") { session.logout(); render() }
+        button("Sign out") {
+            lifecycleScope.launch {
+                withContext(Dispatchers.IO) { SuperAppSession.get(this@MainActivity).logout() }
+                refresh()
+            }
+        }
     }
 
     /** userinfo may be a JWS (eSignet signs it); show its claims, never the raw token. */
@@ -89,10 +118,7 @@ class MainActivity : AppCompatActivity() {
     private fun text(t: String, bold: Boolean = false) = TextView(this).apply {
         text = t; textSize = 15f; setPadding(0, 12, 0, 12); if (bold) setTypeface(typeface, Typeface.BOLD); root.addView(this)
     }
-    private fun mono(t: String) = text(t).apply { typeface = Typeface.MONOSPACE; textSize = 11f }
     private fun button(label: String, onClick: (View) -> Unit) = Button(this).apply {
         text = label; setOnClickListener(onClick); root.addView(this)
     }
-    private fun copy(label: String, value: String) =
-        (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText(label, value))
 }

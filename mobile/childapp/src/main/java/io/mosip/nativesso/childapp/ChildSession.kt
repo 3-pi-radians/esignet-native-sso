@@ -82,9 +82,10 @@ class ChildSession private constructor(private val context: Context) {
 
     fun completeConsentFlow(redirect: Uri) {
         val p = pending.read() ?: throw OAuthException("no consent flow in progress")
+        // A forged deep link without this flow's state is ignored and leaves the flow intact.
+        if (redirect.getQueryParameter("state") != p.getString("state")) throw OAuthException("state mismatch")
         pending.clear()
         redirect.getQueryParameter("error")?.let { throw OAuthException("consent not given: $it") }
-        if (redirect.getQueryParameter("state") != p.getString("state")) throw OAuthException("state mismatch")
         val code = redirect.getQueryParameter("code") ?: throw OAuthException("no authorization code")
         val res = client.exchangeCode(code, BuildConfig.CHILD_REDIRECT_URI,
             Pkce(p.getString("verifier"), p.getString("challenge")), ownProofs)
@@ -125,7 +126,6 @@ class ChildSession private constructor(private val context: Context) {
 
     private fun explain(code: String) = when (code) {
         SsoContract.ERROR_NOT_SIGNED_IN -> "Sign in to the eSignet Super App first."
-        SsoContract.ERROR_SESSION_EXPIRED -> "The Super App session has expired. Open the Super App and sign in again."
         SsoContract.ERROR_CALLER_NOT_TRUSTED -> "The Super App does not trust this app."
         "super_app_missing_or_untrusted" -> "The eSignet Super App is not installed (or is not from the same vendor)."
         "bind_denied" -> "This app is not permitted to use the Super App's sign-in."
