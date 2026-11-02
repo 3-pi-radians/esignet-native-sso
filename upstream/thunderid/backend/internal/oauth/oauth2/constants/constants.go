@@ -1,0 +1,370 @@
+// Copyright 2025-2026 The ThunderID Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package constants defines constants used across the OAuth2 module.
+package constants
+
+import (
+	"errors"
+
+	"github.com/thunder-id/thunderid/internal/oauth/oauth2/model"
+)
+
+// OAuth2 request parameters.
+const (
+	RequestParamGrantType           string = "grant_type"
+	RequestParamClientID            string = "client_id"
+	RequestParamClientSecret        string = "client_secret"
+	RequestParamClientAssertion     string = "client_assertion"
+	RequestParamClientAssertionType string = "client_assertion_type"
+	RequestParamRedirectURI         string = "redirect_uri"
+	RequestParamUsername            string = "username"
+	RequestParamPassword            string = "password"
+	RequestParamScope               string = "scope"
+	RequestParamCode                string = "code"
+	RequestParamCodeVerifier        string = "code_verifier"
+	RequestParamCodeChallenge       string = "code_challenge"
+	RequestParamCodeChallengeMethod string = "code_challenge_method"
+	RequestParamRefreshToken        string = "refresh_token"
+	RequestParamResponseType        string = "response_type"
+	RequestParamResponseMode        string = "response_mode"
+	RequestParamState               string = "state"
+	RequestParamIss                 string = "iss"
+	RequestParamResource            string = "resource"
+	RequestParamError               string = "error"
+	RequestParamErrorDescription    string = "error_description"
+	RequestParamToken               string = "token"
+	RequestParamTokenTypeHint       string = "token_type_hint"
+	RequestParamSubjectToken        string = "subject_token"
+	RequestParamSubjectTokenType    string = "subject_token_type"
+	RequestParamActorToken          string = "actor_token"
+	RequestParamActorTokenType      string = "actor_token_type"
+	RequestParamRequestedTokenType  string = "requested_token_type"
+	RequestParamAudience            string = "audience"
+	RequestParamAssertion           string = "assertion"
+	RequestParamClaims              string = "claims"
+	RequestParamClaimsLocales       string = "claims_locales"
+	RequestParamUILocales           string = "ui_locales"
+	RequestParamNonce               string = "nonce"
+	RequestParamPrompt              string = "prompt"
+	RequestParamRequestURI          string = "request_uri"
+	RequestParamAcrValues           string = "acr_values"
+	RequestParamMaxAge              string = "max_age"
+	RequestParamDPoPJkt             string = "dpop_jkt"
+	RequestParamLoginHint           string = "login_hint"
+	RequestParamIDTokenHint         string = "id_token_hint"
+	RequestParamPostLogoutRedirect  string = "post_logout_redirect_uri"
+	RequestParamLoginHintToken      string = "login_hint_token" // #nosec G101
+	RequestParamBindingMessage      string = "binding_message"
+	RequestParamRequestedExpiry     string = "requested_expiry"
+	RequestParamAuthReqID           string = "auth_req_id"
+)
+
+// OAuth2 HTTP headers.
+const (
+	HeaderDPoP string = "DPoP"
+)
+
+// OAuth2 response modes.
+const (
+	ResponseModeQuery string = "query"
+)
+
+// IsSupportedResponseMode checks if the response mode is supported.
+func IsSupportedResponseMode(responseMode string) bool {
+	return responseMode == "" || responseMode == ResponseModeQuery
+}
+
+// OIDC prompt parameter values.
+const (
+	PromptNone          string = "none"
+	PromptLogin         string = "login"
+	PromptConsent       string = "consent"
+	PromptSelectAccount string = "select_account"
+)
+
+// ValidPromptValues contains all valid OIDC prompt parameter values.
+var ValidPromptValues = []string{
+	PromptNone, PromptLogin, PromptConsent, PromptSelectAccount,
+}
+
+// OAuth2 request parameter validation limits.
+const (
+	// MaxNonceLength defines the maximum allowed length of the nonce parameter.
+	// Aligned with FAPI 2.0 Security Profile recommendation (64 characters).
+	MaxNonceLength = 64
+)
+
+// Server OAuth constants.
+const (
+	AuthID                string = "authId"
+	SessionDataKeyConsent string = "sessionDataKeyConsent"
+	ShowInsecureWarning   string = "showInsecureWarning"
+	AppID                 string = "applicationId"
+	ExecutionID           string = "executionId"
+)
+
+// Oauth message types.
+const (
+	TypeInitialAuthorizationRequest     string = "initialAuthorizationRequest"
+	TypeAuthorizationResponseFromEngine string = "authorizationResponseFromEngine"
+	TypeConsentResponseFromUser         string = "consentResponseFromUser"
+)
+
+// OAuth2 endpoints.
+const (
+	OAuth2TokenEndpoint                   string = "/oauth2/token" // #nosec G101
+	OAuth2AuthorizationEndpoint           string = "/oauth2/authorize"
+	OAuth2IntrospectionEndpoint           string = "/oauth2/introspect"
+	OAuth2RevokeEndpoint                  string = "/oauth2/revoke"
+	OAuth2UserInfoEndpoint                string = "/oauth2/userinfo"
+	OAuth2JWKSEndpoint                    string = "/oauth2/jwks"
+	OAuth2LogoutEndpoint                  string = "/oauth2/logout"
+	OAuth2DCREndpoint                     string = "/oauth2/dcr/register"
+	OAuth2PAREndpoint                     string = "/oauth2/par"
+	OAuth2BackchannelAuthEndpoint         string = "/oauth2/bc-authorize"
+	OAuth2BackchannelAuthCallbackEndpoint string = "/oauth2/bc-authorize/callback"
+)
+
+// OAuth2 token types.
+const (
+	TokenTypeBearer = "Bearer"
+	TokenTypeDPoP   = "DPoP"
+	// TokenTypeNA is the token_type returned in an RFC 8693 response whose issued token is not an
+	// access token. It is used for the ID-JAG (Identity Assertion Authorization Grant) response.
+	TokenTypeNA = "N_A"
+)
+
+// TokenTypeIdentifier defines a type for RFC 8693 token type identifiers.
+type TokenTypeIdentifier string
+
+// RFC 8693 Token Type Identifiers
+const (
+	//nolint:gosec // Token type identifier, not a credential
+	TokenTypeIdentifierAccessToken TokenTypeIdentifier = "urn:ietf:params:oauth:token-type:access_token"
+	//nolint:gosec // Token type identifier, not a credential
+	TokenTypeIdentifierRefreshToken TokenTypeIdentifier = "urn:ietf:params:oauth:token-type:refresh_token"
+	//nolint:gosec // Token type identifier, not a credential
+	TokenTypeIdentifierIDToken TokenTypeIdentifier = "urn:ietf:params:oauth:token-type:id_token"
+	//nolint:gosec // Token type identifier, not a credential
+	TokenTypeIdentifierJWT TokenTypeIdentifier = "urn:ietf:params:oauth:token-type:jwt"
+	// TokenTypeIdentifierIDJAG is the requested/issued token type for an Identity Assertion
+	// Authorization Grant (draft-ietf-oauth-identity-assertion-authz-grant).
+	//nolint:gosec // Token type identifier, not a credential
+	TokenTypeIdentifierIDJAG TokenTypeIdentifier = "urn:ietf:params:oauth:token-type:id-jag"
+	// TokenTypeIdentifierDeviceSecret is the actor_token_type of an OpenID Connect Native SSO device
+	// secret (OpenID Connect Native SSO for Mobile Apps 1.0, section 4.1).
+	//nolint:gosec // Token type identifier, not a credential
+	TokenTypeIdentifierDeviceSecret TokenTypeIdentifier = "urn:openid:params:token-type:device-secret"
+)
+
+// supportedTokenTypeIdentifiers is the single source of truth for all supported token type identifiers.
+var supportedTokenTypeIdentifiers = []TokenTypeIdentifier{
+	TokenTypeIdentifierAccessToken,
+	TokenTypeIdentifierRefreshToken,
+	TokenTypeIdentifierIDToken,
+	TokenTypeIdentifierJWT,
+	TokenTypeIdentifierIDJAG,
+	TokenTypeIdentifierDeviceSecret,
+}
+
+// IsValid checks if the TokenTypeIdentifier is valid.
+func (tti TokenTypeIdentifier) IsValid() bool {
+	for _, valid := range supportedTokenTypeIdentifiers {
+		if tti == valid {
+			return true
+		}
+	}
+	return false
+}
+
+// OAuth2 error codes.
+const (
+	ErrorInvalidRequest           string = "invalid_request"
+	ErrorInvalidClient            string = "invalid_client"
+	ErrorInvalidGrant             string = "invalid_grant"
+	ErrorUnauthorizedClient       string = "unauthorized_client"
+	ErrorUnsupportedGrantType     string = "unsupported_grant_type"
+	ErrorInvalidScope             string = "invalid_scope"
+	ErrorInvalidTarget            string = "invalid_target"
+	ErrorServerError              string = "server_error"
+	ErrorUnsupportedTokenType     string = "unsupported_token_type" //nolint:gosec // OAuth error code, not a credential
+	ErrorUnsupportedResponseType  string = "unsupported_response_type"
+	ErrorAccessDenied             string = "access_denied"
+	ErrorLoginRequired            string = "login_required"
+	ErrorConsentRequired          string = "consent_required"
+	ErrorAccountSelectionRequired string = "account_selection_required"
+	ErrorInvalidDPoPProof         string = "invalid_dpop_proof"
+	ErrorInteractionRequired      string = "interaction_required"
+	ErrorAuthorizationPending     string = "authorization_pending"
+	ErrorSlowDown                 string = "slow_down"
+	ErrorExpiredToken             string = "expired_token" // #nosec G101
+	ErrorUnknownUserID            string = "unknown_user_id"
+	ErrorInvalidBindingMessage    string = "invalid_binding_message"
+)
+
+// UnSupportedGrantTypeError is returned when an unsupported grant type is requested.
+var UnSupportedGrantTypeError = errors.New("unsupported_grant_type")
+
+// StandardOIDCScopes contains all standard OIDC scopes
+var StandardOIDCScopes = map[string]model.OIDCScope{
+	"openid": {
+		Name:        "openid",
+		Description: "REQUIRED scope for OpenID Connect authentication",
+		Claims:      []string{"sub"},
+	},
+	"profile": {
+		Name:        "profile",
+		Description: "Requests access to end-user's default profile claims",
+		Claims: []string{
+			"name", "family_name", "given_name", "middle_name",
+			"nickname", "preferred_username", "profile", "picture",
+			"website", "gender", "birthdate", "zoneinfo", "locale", "updated_at",
+		},
+	},
+	"email": {
+		Name:        "email",
+		Description: "Requests access to email and email_verified claims",
+		Claims:      []string{"email", "email_verified"},
+	},
+	"phone": {
+		Name:        "phone",
+		Description: "Requests access to phone_number and phone_number_verified claims",
+		Claims:      []string{"phone_number", "phone_number_verified"},
+	},
+	"address": {
+		Name:        "address",
+		Description: "Requests access to address claim",
+		Claims:      []string{"address"},
+	},
+	"roles": {
+		Name:        "roles",
+		Description: "Requests access to user's assigned roles",
+		Claims:      []string{"roles"},
+	},
+}
+
+// Standard JWT claim names.
+const (
+	ClaimSub      string = "sub"
+	ClaimIss      string = "iss"
+	ClaimAud      string = "aud"
+	ClaimAzp      string = "azp"
+	ClaimExp      string = "exp"
+	ClaimIat      string = "iat"
+	ClaimJTI      string = "jti"
+	ClaimAuthTime string = "auth_time"
+)
+
+// Custom JWT claim names.
+const (
+	ClaimUserType string = "userType"
+	ClaimOUID     string = "ouId"
+	ClaimOUName   string = "ouName"
+	ClaimOUHandle string = "ouHandle"
+	// ClaimName and ClaimOwner carry an agent's system-attribute name/owner on its client token.
+	ClaimName                   string = "name"
+	ClaimOwner                  string = "owner"
+	ClaimClaimsRequest          string = "claims_req"
+	ClaimClaimsLocales          string = "claims_locales"
+	ClaimCompletedAuthClass     string = "completed_auth_class"
+	ClaimDPoPJkt                string = "dpop_jkt"
+	ClaimAuthorizedPermissions  string = "authorized_permissions"
+	ClaimAuthorizationRequestID string = "authorization_request_id"
+	ClaimClientID               string = "client_id"
+	ClaimAccessTokenSubject     string = "access_token_sub"
+	// ClaimIDP identifies the source identity provider (by issuer) that authenticated the subject of a
+	// jwt-bearer-grant (ID-JAG) access token, so downstream consumers can distinguish a federated
+	// principal from a local one.
+	ClaimIDP string = "idp"
+	// ClaimTokenFamilyID identifies the token family (one authorization grant) a token belongs to.
+	// A single tfid is minted per grant during the login flow and rides every access and refresh
+	// token of that grant, unchanged across refresh rotation, so revocation can target a whole
+	// family at once. Revocation-only and not a client-managed identifier: it rides the token JWTs
+	// but is not part of any client-facing API.
+	ClaimTokenFamilyID string = "tfid"
+)
+
+// SurfaceableClientSystemClaims is the fixed set of entity system-attribute keys that may be
+// surfaced as client-token claims.
+var SurfaceableClientSystemClaims = map[string]bool{
+	ClaimName:  true,
+	ClaimOwner: true,
+}
+
+// OIDC subject types.
+const (
+	SubjectTypePublic string = "public"
+)
+
+// Token-exchange token family modes (oauth.token_exchange.token_family).
+const (
+	// TokenExchangeTokenFamilyNone issues an exchanged token with no token family id (independent).
+	TokenExchangeTokenFamilyNone string = "none"
+	// TokenExchangeTokenFamilyInherit copies the subject token's token family id onto the exchanged token.
+	TokenExchangeTokenFamilyInherit string = "inherit"
+)
+
+// User attribute constants.
+const (
+	// UserAttributeGroups is the constant for user's groups attribute.
+	UserAttributeGroups = "groups"
+	// UserAttributeRoles is the constant for user's roles attribute.
+	UserAttributeRoles = "roles"
+	// DefaultGroupListLimit is the default limit for group list retrieval.
+	DefaultGroupListLimit = 20
+)
+
+// Standard OIDC scope names.
+const (
+	ScopeOpenID = "openid"
+	// ScopeDeviceSSO requests an OpenID Connect Native SSO device secret on the authorization_code
+	// grant. It is an OpenID protocol scope (it releases no user claims) and is only valid on the
+	// authorization request and the authorization_code token request, never on token exchange.
+	ScopeDeviceSSO = "device_sso"
+)
+
+// OpenID Connect Native SSO claim names.
+const (
+	// ClaimSessionID is the OIDC sid claim identifying the authentication session.
+	ClaimSessionID = "sid"
+	// ClaimDeviceSecretHash is the Native SSO ds_hash claim binding an ID token to a device secret.
+	ClaimDeviceSecretHash = "ds_hash"
+)
+
+const (
+	// SupportedClientAssertionType is the constant for supported client assertion type.
+	SupportedClientAssertionType = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+)
+
+const (
+	// AttributeCacheTTLBufferSeconds is a fixed buffer added to attribute cache TTL values to
+	// account for the gap between cache entry creation (end of authentication) and token issuance.
+	AttributeCacheTTLBufferSeconds = 60
+)
+
+const (
+	// CIBADefaultExpiresInSeconds is the default lifetime in seconds of a CIBA authentication request.
+	CIBADefaultExpiresInSeconds = 120
+	// CIBADefaultIntervalSeconds is the default minimum interval in seconds between CIBA token polls.
+	CIBADefaultIntervalSeconds = 5
+	// CIBAMaxExpiresInSeconds is the maximum lifetime in seconds a client may request via requested_expiry.
+	CIBAMaxExpiresInSeconds = 600
+)
+
+const (
+	// SupportedAuthorizationGrantProfileIDJAG is the constant for supported authorization grant profile ID-JAG.
+	SupportedAuthorizationGrantProfileIDJAG = "urn:ietf:params:oauth:grant-profile:id-jag"
+)
+
+// GetStandardClaims returns all standard JWT claims that are always included in tokens.
+func GetStandardClaims() []string {
+	return []string{
+		ClaimSub,
+		ClaimIss,
+		ClaimAud,
+		ClaimExp,
+		ClaimIat,
+		ClaimAuthTime,
+	}
+}

@@ -1,0 +1,184 @@
+// Copyright 2025-2026 The ThunderID Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package granthandlers
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/thunder-id/thunderid/internal/oauth/oauth2/constants"
+	"github.com/thunder-id/thunderid/pkg/thunderidengine/providers"
+	"github.com/thunder-id/thunderid/tests/mocks/actorprovidermock"
+	"github.com/thunder-id/thunderid/tests/mocks/attributecachemock"
+	rbacauthzmock "github.com/thunder-id/thunderid/tests/mocks/authzmock"
+	"github.com/thunder-id/thunderid/tests/mocks/jose/jwtmock"
+	"github.com/thunder-id/thunderid/tests/mocks/oauth/oauth2/authzmock"
+	"github.com/thunder-id/thunderid/tests/mocks/oauth/oauth2/cibamock"
+	"github.com/thunder-id/thunderid/tests/mocks/oauth/oauth2/revocationmock"
+	"github.com/thunder-id/thunderid/tests/mocks/oauth/oauth2/tokenservicemock"
+	"github.com/thunder-id/thunderid/tests/mocks/oumock"
+	"github.com/thunder-id/thunderid/tests/mocks/resourcemock"
+	"github.com/thunder-id/thunderid/tests/testhelpers"
+)
+
+type GrantHandlerProviderTestSuite struct {
+	suite.Suite
+	provider             GrantHandlerProviderInterface
+	mockJWTService       *jwtmock.JWTServiceInterfaceMock
+	authzService         *authzmock.AuthorizeServiceInterfaceMock
+	mockTokenBuilder     *tokenservicemock.TokenBuilderInterfaceMock
+	mockTokenValidator   *tokenservicemock.TokenValidatorInterfaceMock
+	mockAttrCacheService *attributecachemock.AttributeCacheServiceInterfaceMock
+	mockOUService        *oumock.OrganizationUnitServiceInterfaceMock
+	mockRBACAuthzService *rbacauthzmock.AuthorizationProviderMock
+	mockEntityProvider   *actorprovidermock.ActorProviderMock
+	mockResourceService  *resourcemock.ResourceServiceInterfaceMock
+	mockCIBAService      *cibamock.CIBAServiceInterfaceMock
+}
+
+func TestGrantHandlerProviderSuite(t *testing.T) {
+	suite.Run(t, new(GrantHandlerProviderTestSuite))
+}
+
+func (suite *GrantHandlerProviderTestSuite) SetupTest() {
+	suite.mockJWTService = jwtmock.NewJWTServiceInterfaceMock(suite.T())
+	suite.authzService = authzmock.NewAuthorizeServiceInterfaceMock(suite.T())
+	suite.mockTokenBuilder = tokenservicemock.NewTokenBuilderInterfaceMock(suite.T())
+	suite.mockTokenValidator = tokenservicemock.NewTokenValidatorInterfaceMock(suite.T())
+	suite.mockAttrCacheService = attributecachemock.NewAttributeCacheServiceInterfaceMock(suite.T())
+	suite.mockOUService = oumock.NewOrganizationUnitServiceInterfaceMock(suite.T())
+	suite.mockRBACAuthzService = rbacauthzmock.NewAuthorizationProviderMock(suite.T())
+	suite.mockEntityProvider = actorprovidermock.NewActorProviderMock(suite.T())
+	suite.mockResourceService = resourcemock.NewResourceServiceInterfaceMock(suite.T())
+	suite.mockCIBAService = cibamock.NewCIBAServiceInterfaceMock(suite.T())
+	suite.provider = newGrantHandlerProvider(
+		suite.mockJWTService,
+		suite.authzService,
+		suite.mockTokenBuilder,
+		suite.mockTokenValidator,
+		suite.mockAttrCacheService,
+		suite.mockOUService,
+		suite.mockRBACAuthzService,
+		suite.mockEntityProvider,
+		suite.mockResourceService,
+		suite.mockCIBAService,
+		revocationmock.NewRefreshTokenRevokerInterfaceMock(suite.T()),
+		revocationmock.NewCriteriaRevokerInterfaceMock(suite.T()),
+		nil,
+		testhelpers.OAuthConfig(),
+	)
+}
+
+func (suite *GrantHandlerProviderTestSuite) TestNewGrantHandlerProvider() {
+	provider := newGrantHandlerProvider(
+		suite.mockJWTService,
+		suite.authzService,
+		suite.mockTokenBuilder,
+		suite.mockTokenValidator,
+		suite.mockAttrCacheService,
+		suite.mockOUService,
+		suite.mockRBACAuthzService,
+		suite.mockEntityProvider,
+		suite.mockResourceService,
+		suite.mockCIBAService,
+		revocationmock.NewRefreshTokenRevokerInterfaceMock(suite.T()),
+		revocationmock.NewCriteriaRevokerInterfaceMock(suite.T()),
+		nil,
+		testhelpers.OAuthConfig(),
+	)
+	assert.NotNil(suite.T(), provider)
+	assert.Implements(suite.T(), (*GrantHandlerProviderInterface)(nil), provider)
+}
+
+func (suite *GrantHandlerProviderTestSuite) TestGetGrantHandler_ClientCredentials() {
+	handler, err := suite.provider.GetGrantHandler(providers.GrantTypeClientCredentials)
+
+	assert.NoError(suite.T(), err)
+	assert.NotNil(suite.T(), handler)
+	assert.Implements(suite.T(), (*GrantHandlerInterface)(nil), handler)
+}
+
+func (suite *GrantHandlerProviderTestSuite) TestGetGrantHandler_AuthorizationCode() {
+	handler, err := suite.provider.GetGrantHandler(providers.GrantTypeAuthorizationCode)
+
+	assert.NoError(suite.T(), err)
+	assert.NotNil(suite.T(), handler)
+	assert.Implements(suite.T(), (*GrantHandlerInterface)(nil), handler)
+}
+
+func (suite *GrantHandlerProviderTestSuite) TestGetGrantHandler_RefreshToken() {
+	handler, err := suite.provider.GetGrantHandler(providers.GrantTypeRefreshToken)
+
+	assert.NoError(suite.T(), err)
+	assert.NotNil(suite.T(), handler)
+	assert.Implements(suite.T(), (*GrantHandlerInterface)(nil), handler)
+	assert.Implements(suite.T(), (*RefreshTokenGrantHandlerInterface)(nil), handler)
+}
+
+func (suite *GrantHandlerProviderTestSuite) TestGetGrantHandler_TokenExchange() {
+	handler, err := suite.provider.GetGrantHandler(providers.GrantTypeTokenExchange)
+
+	assert.NoError(suite.T(), err)
+	assert.NotNil(suite.T(), handler)
+	assert.Implements(suite.T(), (*GrantHandlerInterface)(nil), handler)
+}
+
+func (suite *GrantHandlerProviderTestSuite) TestGetGrantHandler_CIBA() {
+	handler, err := suite.provider.GetGrantHandler(providers.GrantTypeCIBA)
+
+	assert.NoError(suite.T(), err)
+	assert.NotNil(suite.T(), handler)
+	assert.Implements(suite.T(), (*GrantHandlerInterface)(nil), handler)
+}
+
+func (suite *GrantHandlerProviderTestSuite) TestGetGrantHandler_JWTBearer() {
+	handler, err := suite.provider.GetGrantHandler(providers.GrantTypeJWTBearer)
+
+	assert.NoError(suite.T(), err)
+	assert.NotNil(suite.T(), handler)
+	assert.Implements(suite.T(), (*GrantHandlerInterface)(nil), handler)
+}
+
+func (suite *GrantHandlerProviderTestSuite) TestGetGrantHandler_UnsupportedGrantType() {
+	unsupportedGrantTypes := []struct {
+		name      string
+		grantType providers.GrantType
+	}{
+		{"InvalidType", providers.GrantType("invalid_type")},
+		{"EmptyType", providers.GrantType("")},
+	}
+
+	for _, tc := range unsupportedGrantTypes {
+		suite.T().Run(tc.name, func(t *testing.T) {
+			handler, err := suite.provider.GetGrantHandler(tc.grantType)
+
+			assert.Error(t, err)
+			assert.Nil(t, handler)
+			assert.Equal(t, constants.UnSupportedGrantTypeError, err)
+		})
+	}
+}
+
+func (suite *GrantHandlerProviderTestSuite) TestGetGrantHandler_AllSupportedTypes() {
+	supportedTypes := []providers.GrantType{
+		providers.GrantTypeClientCredentials,
+		providers.GrantTypeAuthorizationCode,
+		providers.GrantTypeRefreshToken,
+		providers.GrantTypeTokenExchange,
+		providers.GrantTypeCIBA,
+		providers.GrantTypeJWTBearer,
+	}
+
+	for _, grantType := range supportedTypes {
+		suite.T().Run(string(grantType), func(t *testing.T) {
+			handler, err := suite.provider.GetGrantHandler(grantType)
+
+			assert.NoError(t, err)
+			assert.NotNil(t, handler)
+			assert.Implements(t, (*GrantHandlerInterface)(nil), handler)
+		})
+	}
+}

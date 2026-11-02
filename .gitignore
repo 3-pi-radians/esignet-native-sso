@@ -1,0 +1,18 @@
+# Upstream clones (recreated by scripts/setup-workspace.sh; our changes live in patches/ and upstream/)
+/esignet/
+/thunderid/
+
+# Only README.md is published as Markdown
+*.md
+!README.md
+
+# Hackathon handout PDFs
+*.pdf
+
+# Local runtime state: Postgres data, logs, binaries, PKCS12 keystore
+demo/.run/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

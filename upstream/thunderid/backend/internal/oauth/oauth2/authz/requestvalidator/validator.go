@@ -1,0 +1,187 @@
+// Copyright 2026 The ThunderID Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package requestvalidator provides shared validation for OAuth2 authorization
+// request parameters used by both the authorize and PAR endpoints.
+package requestvalidator
+
+import (
+	"net/url"
+	"slices"
+	"strings"
+
+	"github.com/thunder-id/thunderid/internal/oauth/oauth2/constants"
+	"github.com/thunder-id/thunderid/internal/oauth/oauth2/pkce"
+	"github.com/thunder-id/thunderid/internal/system/jose/jws"
+	"github.com/thunder-id/thunderid/pkg/thunderidengine/providers"
+)
+
+// ValidateAuthorizationRequestParams validates the common authorization request parameters
+// shared by both the standard authorize endpoint and the PAR endpoint.
+//
+// This validates: prompt, grant_type, response_type, PKCE, nonce, dpop_jkt, and the device_sso scope.
+// Callers are responsible for validating client_id and redirect_uri before calling this
+// function, since those validations have endpoint-specific error handling semantics
+// (e.g., the authorize endpoint must not redirect errors when the redirect_uri is invalid).
+// Resource indicators (RFC 8707) are multi-valued and must be validated separately by callers
+// via resourceindicators.ValidateResourceURIs.
+//
+// dpopHeaderJkt is the thumbprint computed from a verified DPoP proof at the same endpoint
+// or empty when no proof was sent. When both the dpop_jkt request
+// param and a proof-derived thumbprint are present, they must match.
+//
+// Returns (errorCode, errorDescription). Empty errorCode means validation passed.
+func ValidateAuthorizationRequestParams(
+	rawParams map[string][]string, oauthApp *providers.OAuthClient, dpopHeaderJkt string,
+) (string, string) {
+	params := url.Values(rawParams)
+	responseType := params.Get(constants.RequestParamResponseType)
+	responseMode := params.Get(constants.RequestParamResponseMode)
+
+	// Validate the prompt parameter if present.
+	if params.Has(constants.RequestParamPrompt) {
+		if errCode, errMsg := ValidatePromptParameter(params.Get(constants.RequestParamPrompt)); errCode != "" {
+			return errCode, errMsg
+		}
+	}
+
+	// Validate grant type is allowed.
+	if !oauthApp.IsAllowedGrantType(providers.GrantTypeAuthorizationCode) {
+		return constants.ErrorUnauthorizedClient,
+			"Authorization code grant type is not allowed for the client"
+	}
+
+	// Validate response type.
+	if responseType == "" {
+		return constants.ErrorInvalidRequest, "Missing response_type parameter"
+	}
+	if !oauthApp.IsAllowedResponseType(responseType) {
+		return constants.ErrorUnsupportedResponseType, "Unsupported response type"
+	}
+	if !constants.IsSupportedResponseMode(responseMode) {
+		return constants.ErrorInvalidRequest, "Unsupported response_mode parameter"
+	}
+
+	// Validate PKCE parameters.
+	if responseType == string(providers.ResponseTypeCode) {
+		codeChallenge := params.Get(constants.RequestParamCodeChallenge)
+		codeChallengeMethod := params.Get(constants.RequestParamCodeChallengeMethod)
+
+		if oauthApp.RequiresPKCE() && codeChallenge == "" {
+			return constants.ErrorInvalidRequest, "code_challenge is required for this application"
+		}
+
+		if codeChallenge != "" || codeChallengeMethod != "" {
+			if err := pkce.ValidateCodeChallenge(codeChallenge, codeChallengeMethod); err != nil {
+				return constants.ErrorInvalidRequest,
+					"Invalid code_challenge or code_challenge_method parameter"
+			}
+		}
+	}
+
+	// Validate nonce length.
+	nonce := params.Get(constants.RequestParamNonce)
+	if nonce != "" && len(nonce) > constants.MaxNonceLength {
+		return constants.ErrorInvalidRequest, "nonce exceeds maximum allowed length"
+	}
+
+	if errCode, errMsg := ValidateDeviceSSOScope(params.Get(constants.RequestParamScope), oauthApp); errCode != "" {
+		return errCode, errMsg
+	}
+
+	if dpopJktParam := params.Get(constants.RequestParamDPoPJkt); dpopJktParam != "" {
+		if !jws.IsValidJKT(dpopJktParam) {
+			return constants.ErrorInvalidRequest, "Invalid dpop_jkt parameter"
+		}
+		if dpopHeaderJkt != "" && dpopJktParam != dpopHeaderJkt {
+			return constants.ErrorInvalidDPoPProof,
+				"dpop_jkt parameter does not match DPoP proof thumbprint"
+		}
+	}
+
+	return "", ""
+}
+
+// ValidateDeviceSSOScope enforces OpenID Connect Native SSO rules on a requested scope string: the
+// device_sso scope may only be requested by a client whose registered scopes include device_sso, and
+// only together with openid (the device secret is bound to an ID token). A scope string without
+// device_sso is always accepted. Returns (errorCode, errorDescription); empty errorCode means valid.
+func ValidateDeviceSSOScope(scope string, oauthApp *providers.OAuthClient) (string, string) {
+	scopes := strings.Fields(scope)
+	if !slices.Contains(scopes, constants.ScopeDeviceSSO) {
+		return "", ""
+	}
+	if oauthApp == nil || !slices.Contains(oauthApp.Scopes, constants.ScopeDeviceSSO) {
+		return constants.ErrorInvalidScope, "The client is not authorized to request the device_sso scope"
+	}
+	if !slices.Contains(scopes, constants.ScopeOpenID) {
+		return constants.ErrorInvalidScope, "The device_sso scope requires the openid scope"
+	}
+	return "", ""
+}
+
+// ValidatePromptParameter validates the OIDC prompt parameter per OIDC Core §3.1.2.1.
+// Returns (errorCode, errorDescription). Empty errorCode means validation passed.
+func ValidatePromptParameter(prompt string) (string, string) {
+	if strings.TrimSpace(prompt) == "" {
+		return constants.ErrorInvalidRequest, "The prompt parameter cannot be empty"
+	}
+
+	values := strings.Fields(prompt)
+
+	for _, v := range values {
+		if !slices.Contains(constants.ValidPromptValues, v) {
+			return constants.ErrorInvalidRequest, "Unsupported prompt parameter value"
+		}
+	}
+
+	if slices.Contains(values, constants.PromptNone) {
+		// "none" must not be combined with other values.
+		if len(values) > 1 {
+			return constants.ErrorInvalidRequest,
+				"prompt value 'none' must not be combined with other values"
+		}
+
+		// The server does not support server-side sessions as of now.
+		return constants.ErrorLoginRequired,
+			"User authentication is required"
+	}
+
+	// The server does not support account selection prompts as of now.
+	if slices.Contains(values, constants.PromptSelectAccount) {
+		return constants.ErrorAccountSelectionRequired,
+			"Account selection is not supported"
+	}
+
+	return "", ""
+}
+
+// ResolveACRValues returns the effective acr_values: requested ACRs filtered against the
+// app's list, falling back to the app's full list when nothing matches or none were requested.
+func ResolveACRValues(requestedAcrValues string, appAcrValues []string) string {
+	requested := parseACRValues(requestedAcrValues)
+	filtered := make([]string, 0, len(requested))
+	for _, acr := range requested {
+		if slices.Contains(appAcrValues, acr) {
+			filtered = append(filtered, acr)
+		}
+	}
+	if len(filtered) == 0 {
+		return strings.Join(appAcrValues, " ")
+	}
+	return strings.Join(filtered, " ")
+}
+
+// parseACRValues splits acr_values into a deduplicated, order-preserving slice.
+func parseACRValues(acrValues string) []string {
+	parts := strings.Fields(acrValues)
+	seen := make(map[string]bool, len(parts))
+	result := make([]string, 0, len(parts))
+	for _, acr := range parts {
+		if !seen[acr] {
+			seen[acr] = true
+			result = append(result, acr)
+		}
+	}
+	return result
+}

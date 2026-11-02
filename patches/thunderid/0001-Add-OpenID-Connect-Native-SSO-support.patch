@@ -1,0 +1,2412 @@
+From ccbb6a84c5c53b770060d7d6388c975d9e035352 Mon Sep 17 00:00:00 2001
+From: Pankaj Deopa <47059657+3-pi-radians@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 00:25:12 +0530
+Subject: [PATCH] Add OpenID Connect Native SSO support
+
+Introduce a DeviceSecretProvider extension point and use it to issue and
+redeem Native SSO device secrets:
+
+- Accept the device_sso scope at /authorize and /par only for clients
+  registered for it, and only together with openid.
+- On the authorization_code grant, mint a device secret bound to the
+  request's DPoP key, emit sid and ds_hash in the ID token and return
+  device_secret in the token response.
+- Handle token exchange with actor_token_type
+  urn:openid:params:token-type:device-secret: validate the device secret,
+  the ID token (signature, issuer, audience, expiry), ds_hash, sid,
+  subject, DPoP key binding, the original client's device_sso
+  registration and the subset scope rule, then issue DPoP-bound tokens.
+- Reject device_sso on token exchange and answer interaction_required for
+  scopes beyond the original grant.
+---
+ backend/.mockery.public.yml                   |   6 +
+ backend/cmd/server/servicemanager.go          |   2 +-
+ backend/internal/oauth/init.go                |   3 +-
+ .../authz/requestvalidator/validator.go       |  24 +-
+ .../authz/requestvalidator/validator_test.go  |  33 +
+ .../oauth/oauth2/constants/constants.go       |  18 +
+ .../granthandlers/authorization_code.go       |  68 +-
+ .../granthandlers/authorization_code_test.go  |   2 +-
+ .../oauth/oauth2/granthandlers/init.go        |   2 +
+ .../oauth/oauth2/granthandlers/native_sso.go  | 153 ++++
+ .../granthandlers/native_sso_exchange.go      | 365 +++++++++
+ .../oauth2/granthandlers/native_sso_test.go   | 767 ++++++++++++++++++
+ .../oauth/oauth2/granthandlers/provider.go    |   6 +-
+ .../oauth2/granthandlers/provider_test.go     |   2 +
+ .../oauth2/granthandlers/token_exchange.go    |  56 +-
+ .../granthandlers/token_exchange_test.go      |   2 +-
+ backend/internal/oauth/oauth2/model/token.go  |   5 +
+ .../internal/oauth/oauth2/token/service.go    |   1 +
+ .../oauth/oauth2/tokenservice/builder.go      |   8 +
+ .../oauth/oauth2/tokenservice/builder_test.go |  40 +
+ .../oauth/oauth2/tokenservice/model.go        |   4 +
+ .../internal/oauth/oauth2/utils/oauthutils.go |   4 +-
+ .../oauth/oauth2/utils/oauthutils_test.go     |   6 +
+ backend/pkg/thunderidengine/engine.go         |   9 +-
+ .../thunderidengine/providers/constants.go    |  23 +
+ .../thunderidengine/providers/interface.go    |  27 +
+ .../pkg/thunderidengine/providers/model.go    |  49 ++
+ .../DeviceSecretProvider_mock.go              | 244 ++++++
+ 28 files changed, 1890 insertions(+), 39 deletions(-)
+ create mode 100644 backend/internal/oauth/oauth2/granthandlers/native_sso.go
+ create mode 100644 backend/internal/oauth/oauth2/granthandlers/native_sso_exchange.go
+ create mode 100644 backend/internal/oauth/oauth2/granthandlers/native_sso_test.go
+ create mode 100644 backend/tests/mocks/devicesecretprovidermock/DeviceSecretProvider_mock.go
+
+diff --git a/backend/.mockery.public.yml b/backend/.mockery.public.yml
+index e03ead7bd..6c8cc9d13 100644
+--- a/backend/.mockery.public.yml
++++ b/backend/.mockery.public.yml
+@@ -575,6 +575,12 @@ packages:
+           structname: '{{.InterfaceName}}Mock'
+           pkgname: flowexecmock
+           filename: "{{.InterfaceName}}_mock.go"
++      DeviceSecretProvider:
++        config:
++          dir: tests/mocks/devicesecretprovidermock
++          structname: '{{.InterfaceName}}Mock'
++          pkgname: devicesecretprovidermock
++          filename: "{{.InterfaceName}}_mock.go"
+       ConsentProvider:
+         config:
+           dir: tests/mocks/consentprovidermock
+diff --git a/backend/cmd/server/servicemanager.go b/backend/cmd/server/servicemanager.go
+index 4579d34a4..c5e0e7420 100644
+--- a/backend/cmd/server/servicemanager.go
++++ b/backend/cmd/server/servicemanager.go
+@@ -483,7 +483,7 @@ func registerServices(mux *http.ServeMux, cacheManager cache.CacheManagerInterfa
+ 	tokenValidator, err := oauth.Initialize(mux, actorProvider, authnProvider, jwtService, jweService,
+ 		flowExecService, observabilitySvc, runtimeCryptoSvc, ouService, attributeCacheService, authZService,
+ 		resourceServerProvider, i18nService, idpService, dpopVerifier,
+-		runtimeStoreProvider, transactioner, revocationEnforcer, revocationSvc, oauthCfg)
++		runtimeStoreProvider, transactioner, revocationEnforcer, revocationSvc, nil, oauthCfg)
+ 	fatalOnError(ctx, logger, err, "Failed to initialize OAuth services")
+ 
+ 	// Initialized after the OAuth services because credential issuance validates the presented
+diff --git a/backend/internal/oauth/init.go b/backend/internal/oauth/init.go
+index 73e3fc392..0c10c1626 100644
+--- a/backend/internal/oauth/init.go
++++ b/backend/internal/oauth/init.go
+@@ -55,6 +55,7 @@ func Initialize(
+ 	transactioner providers.Transactioner,
+ 	enforcementService revocation.EnforcementServiceInterface,
+ 	revocationSvc revocation.RevocationServiceInterface,
++	deviceSecretProvider providers.DeviceSecretProvider,
+ 	cfg oauthconfig.Config,
+ ) (tokenservice.TokenValidatorInterface, error) {
+ 	jwks.Initialize(mux, runtimeCrypto)
+@@ -96,7 +97,7 @@ func Initialize(
+ 	grantHandlerProvider := granthandlers.Initialize(
+ 		jwtService, oauth2AuthzService, tokenBuilder, tokenValidator,
+ 		attributeCacheSvc, ouService, authzService, actorProvider, resourceService,
+-		cibaService, revocationSvc, revocationSvc, cfg)
++		cibaService, revocationSvc, revocationSvc, deviceSecretProvider, cfg)
+ 
+ 	token.Initialize(mux, jwtService, actorProvider, authnProvider, grantHandlerProvider,
+ 		scopeValidator, observabilitySvc, discoveryService, dpopVerifier, jtiStore, cfg)
+diff --git a/backend/internal/oauth/oauth2/authz/requestvalidator/validator.go b/backend/internal/oauth/oauth2/authz/requestvalidator/validator.go
+index b9ecb6738..acc110595 100644
+--- a/backend/internal/oauth/oauth2/authz/requestvalidator/validator.go
++++ b/backend/internal/oauth/oauth2/authz/requestvalidator/validator.go
+@@ -19,7 +19,7 @@ import (
+ // ValidateAuthorizationRequestParams validates the common authorization request parameters
+ // shared by both the standard authorize endpoint and the PAR endpoint.
+ //
+-// This validates: prompt, grant_type, response_type, PKCE, nonce, and dpop_jkt.
++// This validates: prompt, grant_type, response_type, PKCE, nonce, dpop_jkt, and the device_sso scope.
+ // Callers are responsible for validating client_id and redirect_uri before calling this
+ // function, since those validations have endpoint-specific error handling semantics
+ // (e.g., the authorize endpoint must not redirect errors when the redirect_uri is invalid).
+@@ -85,6 +85,10 @@ func ValidateAuthorizationRequestParams(
+ 		return constants.ErrorInvalidRequest, "nonce exceeds maximum allowed length"
+ 	}
+ 
++	if errCode, errMsg := ValidateDeviceSSOScope(params.Get(constants.RequestParamScope), oauthApp); errCode != "" {
++		return errCode, errMsg
++	}
++
+ 	if dpopJktParam := params.Get(constants.RequestParamDPoPJkt); dpopJktParam != "" {
+ 		if !jws.IsValidJKT(dpopJktParam) {
+ 			return constants.ErrorInvalidRequest, "Invalid dpop_jkt parameter"
+@@ -98,6 +102,24 @@ func ValidateAuthorizationRequestParams(
+ 	return "", ""
+ }
+ 
++// ValidateDeviceSSOScope enforces OpenID Connect Native SSO rules on a requested scope string: the
++// device_sso scope may only be requested by a client whose registered scopes include device_sso, and
++// only together with openid (the device secret is bound to an ID token). A scope string without
++// device_sso is always accepted. Returns (errorCode, errorDescription); empty errorCode means valid.
++func ValidateDeviceSSOScope(scope string, oauthApp *providers.OAuthClient) (string, string) {
++	scopes := strings.Fields(scope)
++	if !slices.Contains(scopes, constants.ScopeDeviceSSO) {
++		return "", ""
++	}
++	if oauthApp == nil || !slices.Contains(oauthApp.Scopes, constants.ScopeDeviceSSO) {
++		return constants.ErrorInvalidScope, "The client is not authorized to request the device_sso scope"
++	}
++	if !slices.Contains(scopes, constants.ScopeOpenID) {
++		return constants.ErrorInvalidScope, "The device_sso scope requires the openid scope"
++	}
++	return "", ""
++}
++
+ // ValidatePromptParameter validates the OIDC prompt parameter per OIDC Core §3.1.2.1.
+ // Returns (errorCode, errorDescription). Empty errorCode means validation passed.
+ func ValidatePromptParameter(prompt string) (string, string) {
+diff --git a/backend/internal/oauth/oauth2/authz/requestvalidator/validator_test.go b/backend/internal/oauth/oauth2/authz/requestvalidator/validator_test.go
+index f2e19af6f..1419be6b4 100644
+--- a/backend/internal/oauth/oauth2/authz/requestvalidator/validator_test.go
++++ b/backend/internal/oauth/oauth2/authz/requestvalidator/validator_test.go
+@@ -459,3 +459,36 @@ func (suite *ACRValuesTestSuite) TestResolveACRValues_RequestPresent_NoDefaults_
+ 	result := ResolveACRValues("urn:thunder:acr:password urn:thunder:acr:generated-code", nil)
+ 	assert.Equal(suite.T(), "", result)
+ }
++
++// device_sso (OpenID Connect Native SSO) tests
++
++func (suite *AuthzValidationTestSuite) TestValidateParams_DeviceSSO() {
++	allowed := *suite.oauthApp
++	allowed.Scopes = []string{"email", constants.ScopeDeviceSSO}
++
++	cases := []struct {
++		name    string
++		scope   string
++		app     *providers.OAuthClient
++		wantErr string
++	}{
++		{"ordinary request unaffected", "openid email", suite.oauthApp, ""},
++		{"allowed client with openid", "openid email device_sso", &allowed, ""},
++		{"client not registered for device_sso", "openid device_sso", suite.oauthApp, constants.ErrorInvalidScope},
++		{"device_sso without openid", "email device_sso", &allowed, constants.ErrorInvalidScope},
++		{"device_sso substring is not device_sso", "openid device_sso_extra", suite.oauthApp, ""},
++	}
++	for _, tc := range cases {
++		suite.Run(tc.name, func() {
++			params := suite.validParams()
++			params.Set(constants.RequestParamScope, tc.scope)
++			errCode, _ := ValidateAuthorizationRequestParams(params, tc.app, "")
++			assert.Equal(suite.T(), tc.wantErr, errCode)
++		})
++	}
++}
++
++func (suite *AuthzValidationTestSuite) TestValidateDeviceSSOScope_NilClient() {
++	errCode, _ := ValidateDeviceSSOScope("openid device_sso", nil)
++	assert.Equal(suite.T(), constants.ErrorInvalidScope, errCode)
++}
+diff --git a/backend/internal/oauth/oauth2/constants/constants.go b/backend/internal/oauth/oauth2/constants/constants.go
+index 59ef8d3c8..6e36c9c7a 100644
+--- a/backend/internal/oauth/oauth2/constants/constants.go
++++ b/backend/internal/oauth/oauth2/constants/constants.go
+@@ -152,6 +152,10 @@ const (
+ 	// Authorization Grant (draft-ietf-oauth-identity-assertion-authz-grant).
+ 	//nolint:gosec // Token type identifier, not a credential
+ 	TokenTypeIdentifierIDJAG TokenTypeIdentifier = "urn:ietf:params:oauth:token-type:id-jag"
++	// TokenTypeIdentifierDeviceSecret is the actor_token_type of an OpenID Connect Native SSO device
++	// secret (OpenID Connect Native SSO for Mobile Apps 1.0, section 4.1).
++	//nolint:gosec // Token type identifier, not a credential
++	TokenTypeIdentifierDeviceSecret TokenTypeIdentifier = "urn:openid:params:token-type:device-secret"
+ )
+ 
+ // supportedTokenTypeIdentifiers is the single source of truth for all supported token type identifiers.
+@@ -161,6 +165,7 @@ var supportedTokenTypeIdentifiers = []TokenTypeIdentifier{
+ 	TokenTypeIdentifierIDToken,
+ 	TokenTypeIdentifierJWT,
+ 	TokenTypeIdentifierIDJAG,
++	TokenTypeIdentifierDeviceSecret,
+ }
+ 
+ // IsValid checks if the TokenTypeIdentifier is valid.
+@@ -190,6 +195,7 @@ const (
+ 	ErrorConsentRequired          string = "consent_required"
+ 	ErrorAccountSelectionRequired string = "account_selection_required"
+ 	ErrorInvalidDPoPProof         string = "invalid_dpop_proof"
++	ErrorInteractionRequired      string = "interaction_required"
+ 	ErrorAuthorizationPending     string = "authorization_pending"
+ 	ErrorSlowDown                 string = "slow_down"
+ 	ErrorExpiredToken             string = "expired_token" // #nosec G101
+@@ -312,6 +318,18 @@ const (
+ // Standard OIDC scope names.
+ const (
+ 	ScopeOpenID = "openid"
++	// ScopeDeviceSSO requests an OpenID Connect Native SSO device secret on the authorization_code
++	// grant. It is an OpenID protocol scope (it releases no user claims) and is only valid on the
++	// authorization request and the authorization_code token request, never on token exchange.
++	ScopeDeviceSSO = "device_sso"
++)
++
++// OpenID Connect Native SSO claim names.
++const (
++	// ClaimSessionID is the OIDC sid claim identifying the authentication session.
++	ClaimSessionID = "sid"
++	// ClaimDeviceSecretHash is the Native SSO ds_hash claim binding an ID token to a device secret.
++	ClaimDeviceSecretHash = "ds_hash"
+ )
+ 
+ const (
+diff --git a/backend/internal/oauth/oauth2/granthandlers/authorization_code.go b/backend/internal/oauth/oauth2/granthandlers/authorization_code.go
+index 384d104db..69d715af6 100644
+--- a/backend/internal/oauth/oauth2/granthandlers/authorization_code.go
++++ b/backend/internal/oauth/oauth2/granthandlers/authorization_code.go
+@@ -24,10 +24,11 @@ import (
+ 
+ // authorizationCodeGrantHandler handles the authorization code grant type.
+ type authorizationCodeGrantHandler struct {
+-	authzService    authz.AuthorizeServiceInterface
+-	tokenBuilder    tokenservice.TokenBuilderInterface
+-	attributeCache  attributecache.AttributeCacheServiceInterface
+-	resourceService providers.ResourceServerProvider
++	authzService         authz.AuthorizeServiceInterface
++	tokenBuilder         tokenservice.TokenBuilderInterface
++	attributeCache       attributecache.AttributeCacheServiceInterface
++	resourceService      providers.ResourceServerProvider
++	deviceSecretProvider providers.DeviceSecretProvider
+ }
+ 
+ // newAuthorizationCodeGrantHandler creates a new instance of AuthorizationCodeGrantHandler.
+@@ -36,12 +37,14 @@ func newAuthorizationCodeGrantHandler(
+ 	tokenBuilder tokenservice.TokenBuilderInterface,
+ 	attributeCache attributecache.AttributeCacheServiceInterface,
+ 	resourceService providers.ResourceServerProvider,
++	deviceSecretProvider providers.DeviceSecretProvider,
+ ) GrantHandlerInterface {
+ 	return &authorizationCodeGrantHandler{
+-		authzService:    authzService,
+-		tokenBuilder:    tokenBuilder,
+-		attributeCache:  attributeCache,
+-		resourceService: resourceService,
++		authzService:         authzService,
++		tokenBuilder:         tokenBuilder,
++		attributeCache:       attributeCache,
++		resourceService:      resourceService,
++		deviceSecretProvider: deviceSecretProvider,
+ 	}
+ }
+ 
+@@ -99,6 +102,15 @@ func (h *authorizationCodeGrantHandler) HandleGrant(ctx context.Context, tokenRe
+ 	// Parse authorized scopes
+ 	authorizedScopes := tokenservice.ParseScopes(authCode.Scopes)
+ 
++	// OpenID Connect Native SSO: a code carrying device_sso yields a device secret. Check eligibility
++	// before issuing any token so a refused request issues nothing.
++	deviceSSO := slices.Contains(authorizedScopes, constants.ScopeDeviceSSO)
++	if deviceSSO {
++		if errResp := checkDeviceSSOIssuance(ctx, h.deviceSecretProvider, oauthApp, authorizedScopes); errResp != nil {
++			return nil, errResp
++		}
++	}
++
+ 	// Get user attributes from attribute cache
+ 	attrs := make(map[string]interface{})
+ 	if authCode.AttributeCacheID != "" {
+@@ -186,18 +198,40 @@ func (h *authorizationCodeGrantHandler) HandleGrant(ctx context.Context, tokenRe
+ 		AccessToken: *accessToken,
+ 	}
+ 
++	var sessionID, dsHash string
++	if deviceSSO {
++		var errResp *model.ErrorResponse
++		tokenResponse.DeviceSecret, sessionID, dsHash, errResp = issueDeviceSecret(ctx, h.deviceSecretProvider,
++			h.attributeCache, &providers.DeviceSecretRequest{
++				Subject:  authCode.AuthorizedUserID,
++				ClientID: tokenRequest.ClientID,
++				Scopes:   withoutScope(accessTokenScopes, constants.ScopeDeviceSSO),
++				ACR:      authCode.CompletedACR,
++				Claims: consentedClaimNames(accessTokenScopes, authCode.ClaimsRequest,
++					oauthApp.ScopeClaims, attrs),
++				AuthTime:         authCode.TimeCreated.Unix(),
++				CnfJkt:           dpop.GetJkt(ctx),
++				AttributeCacheID: authCode.AttributeCacheID,
++			}, logger)
++		if errResp != nil {
++			return nil, errResp
++		}
++	}
++
+ 	// Generate ID token if 'openid' scope is present
+ 	if slices.Contains(accessTokenScopes, constants.ScopeOpenID) {
+ 		idToken, err := h.tokenBuilder.BuildIDToken(ctx, &tokenservice.IDTokenBuildContext{
+-			Subject:        authCode.AuthorizedUserID,
+-			Audience:       tokenRequest.ClientID,
+-			Scopes:         accessTokenScopes,
+-			UserAttributes: attrs,
+-			AuthTime:       authCode.TimeCreated.Unix(),
+-			OAuthApp:       oauthApp,
+-			ClaimsRequest:  authCode.ClaimsRequest,
+-			Nonce:          authCode.Nonce,
+-			CompletedACR:   authCode.CompletedACR,
++			Subject:          authCode.AuthorizedUserID,
++			Audience:         tokenRequest.ClientID,
++			Scopes:           accessTokenScopes,
++			UserAttributes:   attrs,
++			AuthTime:         authCode.TimeCreated.Unix(),
++			OAuthApp:         oauthApp,
++			ClaimsRequest:    authCode.ClaimsRequest,
++			Nonce:            authCode.Nonce,
++			CompletedACR:     authCode.CompletedACR,
++			SessionID:        sessionID,
++			DeviceSecretHash: dsHash,
+ 		})
+ 		if err != nil {
+ 			logger.Error(ctx, "Failed to generate ID token", log.Error(err))
+diff --git a/backend/internal/oauth/oauth2/granthandlers/authorization_code_test.go b/backend/internal/oauth/oauth2/granthandlers/authorization_code_test.go
+index 87d0edd09..18d0b692a 100644
+--- a/backend/internal/oauth/oauth2/granthandlers/authorization_code_test.go
++++ b/backend/internal/oauth/oauth2/granthandlers/authorization_code_test.go
+@@ -178,7 +178,7 @@ func (suite *AuthorizationCodeGrantHandlerTestSuite) stubDefaultResourceServer()
+ 
+ func (suite *AuthorizationCodeGrantHandlerTestSuite) TestNewAuthorizationCodeGrantHandler() {
+ 	handler := newAuthorizationCodeGrantHandler(
+-		suite.mockAuthzService, suite.mockTokenBuilder, suite.mockAttrCacheService, suite.mockResourceService)
++		suite.mockAuthzService, suite.mockTokenBuilder, suite.mockAttrCacheService, suite.mockResourceService, nil)
+ 	assert.NotNil(suite.T(), handler)
+ 	assert.Implements(suite.T(), (*GrantHandlerInterface)(nil), handler)
+ }
+diff --git a/backend/internal/oauth/oauth2/granthandlers/init.go b/backend/internal/oauth/oauth2/granthandlers/init.go
+index 5a86a909d..0ea0cecd0 100644
+--- a/backend/internal/oauth/oauth2/granthandlers/init.go
++++ b/backend/internal/oauth/oauth2/granthandlers/init.go
+@@ -30,6 +30,7 @@ func Initialize(
+ 	cibaService ciba.CIBAServiceInterface,
+ 	refreshTokenRevoker revocation.RefreshTokenRevokerInterface,
+ 	criteriaRevoker revocation.CriteriaRevokerInterface,
++	deviceSecretProvider providers.DeviceSecretProvider,
+ 	cfg oauthconfig.Config,
+ ) GrantHandlerProviderInterface {
+ 	return newGrantHandlerProvider(
+@@ -45,6 +46,7 @@ func Initialize(
+ 		cibaService,
+ 		refreshTokenRevoker,
+ 		criteriaRevoker,
++		deviceSecretProvider,
+ 		cfg,
+ 	)
+ }
+diff --git a/backend/internal/oauth/oauth2/granthandlers/native_sso.go b/backend/internal/oauth/oauth2/granthandlers/native_sso.go
+new file mode 100644
+index 000000000..b5e8ebf7d
+--- /dev/null
++++ b/backend/internal/oauth/oauth2/granthandlers/native_sso.go
+@@ -0,0 +1,153 @@
++// Copyright 2026 The ThunderID Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package granthandlers
++
++import (
++	"context"
++	"crypto/sha256"
++	"crypto/subtle"
++	"encoding/base64"
++	"slices"
++	"sort"
++	"time"
++
++	"github.com/thunder-id/thunderid/internal/attributecache"
++	"github.com/thunder-id/thunderid/internal/oauth/oauth2/constants"
++	"github.com/thunder-id/thunderid/internal/oauth/oauth2/dpop"
++	"github.com/thunder-id/thunderid/internal/oauth/oauth2/model"
++	oauth2utils "github.com/thunder-id/thunderid/internal/oauth/oauth2/utils"
++	"github.com/thunder-id/thunderid/internal/system/log"
++	sysutils "github.com/thunder-id/thunderid/internal/system/utils"
++	"github.com/thunder-id/thunderid/pkg/thunderidengine/providers"
++)
++
++// computeDeviceSecretHash returns the ds_hash of a device secret.
++//
++// OpenID Connect Native SSO 1.0 leaves the ds_hash/device_secret binding to the deployment. This
++// implementation uses BASE64URL(SHA-256(device_secret)) over the ASCII octets of the device secret,
++// unpadded, as defined by the MOSIP eSignet Native SSO design.
++func computeDeviceSecretHash(deviceSecret string) string {
++	sum := sha256.Sum256([]byte(deviceSecret))
++	return base64.RawURLEncoding.EncodeToString(sum[:])
++}
++
++// constantTimeEquals compares two strings without leaking their common prefix length through timing.
++func constantTimeEquals(a, b string) bool {
++	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
++}
++
++// withoutScope returns scopes with every occurrence of scope removed.
++func withoutScope(scopes []string, scope string) []string {
++	out := make([]string, 0, len(scopes))
++	for _, s := range scopes {
++		if s != scope {
++			out = append(out, s)
++		}
++	}
++	return out
++}
++
++// consentedClaimNames returns the user claims a login released: the claims mapped to its granted
++// scopes, the claims named in its claims request, and the names of the released user attributes. An
++// opaque identity-system JWT (providers.RawJWTAttributeKey) is not a claim name and is skipped.
++func consentedClaimNames(scopes []string, claimsRequest *model.ClaimsRequest, scopeClaims map[string][]string,
++	attrs map[string]interface{}) []string {
++	set := map[string]struct{}{}
++	for _, scope := range scopes {
++		for _, claim := range oauth2utils.ResolveScopeClaims(scope, scopeClaims) {
++			set[claim] = struct{}{}
++		}
++	}
++	if claimsRequest != nil {
++		for claim := range claimsRequest.IDToken {
++			set[claim] = struct{}{}
++		}
++		for claim := range claimsRequest.UserInfo {
++			set[claim] = struct{}{}
++		}
++	}
++	for name := range attrs {
++		if name != providers.RawJWTAttributeKey {
++			set[name] = struct{}{}
++		}
++	}
++	names := make([]string, 0, len(set))
++	for name := range set {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	return names
++}
++
++// checkDeviceSSOIssuance verifies that a device secret may be issued on an authorization_code grant
++// whose code carries the device_sso scope: the server must have a device secret provider, the client
++// must still be registered for device_sso, openid must have been granted, and the token request must
++// carry a verified DPoP proof (the device secret is bound to that key via cnf.jkt).
++func checkDeviceSSOIssuance(ctx context.Context, deviceSecretProvider providers.DeviceSecretProvider,
++	oauthApp *providers.OAuthClient, grantedScopes []string) *model.ErrorResponse {
++	if deviceSecretProvider == nil {
++		return &model.ErrorResponse{
++			Error:            constants.ErrorInvalidScope,
++			ErrorDescription: "The device_sso scope is not supported by this server",
++		}
++	}
++	if oauthApp == nil || !slices.Contains(oauthApp.Scopes, constants.ScopeDeviceSSO) {
++		return &model.ErrorResponse{
++			Error:            constants.ErrorInvalidScope,
++			ErrorDescription: "The client is not authorized for the device_sso scope",
++		}
++	}
++	if !slices.Contains(grantedScopes, constants.ScopeOpenID) {
++		return &model.ErrorResponse{
++			Error:            constants.ErrorInvalidScope,
++			ErrorDescription: "The device_sso scope requires the openid scope",
++		}
++	}
++	if dpop.GetJkt(ctx) == "" {
++		return &model.ErrorResponse{
++			Error:            constants.ErrorInvalidDPoPProof,
++			ErrorDescription: "A DPoP proof is required to obtain a device_secret",
++		}
++	}
++	return nil
++}
++
++// issueDeviceSecret mints a device secret for the authorization_code grant and returns it together
++// with the session id (sid) and ds_hash to embed in the ID token. When the login cached user
++// attributes, the cache entry is kept alive for the device secret's lifetime so that tokens issued
++// later through Native SSO can release the same consented claims.
++func issueDeviceSecret(
++	ctx context.Context,
++	deviceSecretProvider providers.DeviceSecretProvider,
++	attributeCache attributecache.AttributeCacheServiceInterface,
++	req *providers.DeviceSecretRequest,
++	logger *log.Logger,
++) (deviceSecret, sid, dsHash string, errResp *model.ErrorResponse) {
++	req.AuthID = sysutils.GenerateUUID()
++
++	secret, err := deviceSecretProvider.GenerateDeviceSecret(ctx, req)
++	if err != nil || secret == nil || secret.Value == "" {
++		logger.Error(ctx, "Failed to generate device secret", log.Error(err))
++		return "", "", "", &model.ErrorResponse{
++			Error:            constants.ErrorServerError,
++			ErrorDescription: "Failed to generate device secret",
++		}
++	}
++
++	if req.AttributeCacheID != "" && attributeCache != nil {
++		ttl := secret.ExpiresAt - time.Now().Unix() + constants.AttributeCacheTTLBufferSeconds
++		if ttl > 0 {
++			if svcErr := attributeCache.ExtendAttributeCacheTTL(ctx, req.AttributeCacheID, int(ttl)); svcErr != nil {
++				logger.Error(ctx, "Failed to extend attribute cache TTL for device secret",
++					log.String("error", svcErr.Code))
++				return "", "", "", &model.ErrorResponse{
++					Error:            constants.ErrorServerError,
++					ErrorDescription: "Failed to generate device secret",
++				}
++			}
++		}
++	}
++
++	return secret.Value, req.AuthID, computeDeviceSecretHash(secret.Value), nil
++}
+diff --git a/backend/internal/oauth/oauth2/granthandlers/native_sso_exchange.go b/backend/internal/oauth/oauth2/granthandlers/native_sso_exchange.go
+new file mode 100644
+index 000000000..7363e8fb1
+--- /dev/null
++++ b/backend/internal/oauth/oauth2/granthandlers/native_sso_exchange.go
+@@ -0,0 +1,365 @@
++// Copyright 2026 The ThunderID Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package granthandlers
++
++import (
++	"context"
++	"errors"
++	"slices"
++	"strings"
++	"time"
++
++	"github.com/thunder-id/thunderid/internal/oauth/oauth2/constants"
++	"github.com/thunder-id/thunderid/internal/oauth/oauth2/dpop"
++	"github.com/thunder-id/thunderid/internal/oauth/oauth2/model"
++	"github.com/thunder-id/thunderid/internal/oauth/oauth2/tokenservice"
++	oauth2utils "github.com/thunder-id/thunderid/internal/oauth/oauth2/utils"
++	"github.com/thunder-id/thunderid/internal/system/jose/jwt"
++	"github.com/thunder-id/thunderid/internal/system/log"
++	tidcommon "github.com/thunder-id/thunderid/pkg/thunderidengine/common"
++	"github.com/thunder-id/thunderid/pkg/thunderidengine/providers"
++)
++
++// validateNativeSSORequest checks the request shape of an OpenID Connect Native SSO token exchange
++// (OpenID Connect Native SSO for Mobile Apps 1.0, section 4.1): the subject_token is an ID token, the
++// requested token (if named) is an access token, and resources are not supported.
++func validateNativeSSORequest(tokenRequest *model.TokenRequest) *model.ErrorResponse {
++	if constants.TokenTypeIdentifier(tokenRequest.SubjectTokenType) != constants.TokenTypeIdentifierIDToken {
++		return &model.ErrorResponse{
++			Error: constants.ErrorInvalidRequest,
++			ErrorDescription: "A device-secret actor_token requires subject_token_type " +
++				string(constants.TokenTypeIdentifierIDToken),
++		}
++	}
++	if tokenRequest.RequestedTokenType != "" &&
++		constants.TokenTypeIdentifier(tokenRequest.RequestedTokenType) != constants.TokenTypeIdentifierAccessToken {
++		return &model.ErrorResponse{
++			Error:            constants.ErrorInvalidRequest,
++			ErrorDescription: "Native SSO only issues access tokens",
++		}
++	}
++	if len(tokenRequest.Resources) > 0 {
++		return &model.ErrorResponse{
++			Error:            constants.ErrorInvalidTarget,
++			ErrorDescription: "The resource parameter is not supported for Native SSO",
++		}
++	}
++	return nil
++}
++
++// handleNativeSSOGrant signs a second application in silently using the first application's ID token
++// (subject_token) and device secret (actor_token). The request must carry a DPoP proof made with the
++// key the device secret is bound to.
++func (h *tokenExchangeGrantHandler) handleNativeSSOGrant(ctx context.Context, tokenRequest *model.TokenRequest,
++	oauthApp *providers.OAuthClient) (*model.TokenResponseDTO, *model.ErrorResponse) {
++	logger := log.GetLogger().With(log.String(log.LoggerKeyComponentName, "NativeSSOGrantHandler"))
++
++	if h.deviceSecretProvider == nil {
++		return nil, &model.ErrorResponse{
++			Error:            constants.ErrorInvalidRequest,
++			ErrorDescription: "Native SSO is not supported by this server",
++		}
++	}
++
++	// The spec requires the audience to be the issuer of the ID token, i.e. this server.
++	if len(tokenRequest.Audiences) != 1 || tokenRequest.Audiences[0] != h.cfg.JWT.Issuer {
++		return nil, &model.ErrorResponse{
++			Error:            constants.ErrorInvalidTarget,
++			ErrorDescription: "The audience parameter must be the issuer of the ID token",
++		}
++	}
++
++	// The device secret is bound to a DPoP key; without a verified proof there is nothing to match.
++	jkt := dpop.GetJkt(ctx)
++	if jkt == "" {
++		return nil, &model.ErrorResponse{
++			Error:            constants.ErrorInvalidDPoPProof,
++			ErrorDescription: "A DPoP proof is required for Native SSO",
++		}
++	}
++
++	dsClaims, errResp := h.validateDeviceSecret(ctx, tokenRequest.ClientID, tokenRequest.ActorToken, logger)
++	if errResp != nil {
++		return nil, errResp
++	}
++
++	// The proof key must be the very key the device secret was bound to at issuance.
++	if !constantTimeEquals(jkt, dsClaims.CnfJkt) {
++		return nil, invalidGrant("The DPoP proof key does not match the device_secret binding")
++	}
++
++	idClaims, errResp := h.validateNativeSSOIDToken(ctx, tokenRequest.SubjectToken, dsClaims.ClientID, logger)
++	if errResp != nil {
++		return nil, errResp
++	}
++
++	// ds_hash binds the ID token to this exact device secret.
++	dsHash, _ := idClaims[constants.ClaimDeviceSecretHash].(string)
++	if dsHash == "" || !constantTimeEquals(dsHash, computeDeviceSecretHash(tokenRequest.ActorToken)) {
++		return nil, invalidGrant("The subject_token is not bound to the device_secret")
++	}
++
++	// sid ties the ID token to the authentication session recorded in the device secret; the
++	// provider has already confirmed that session is still active.
++	sid, _ := idClaims[constants.ClaimSessionID].(string)
++	if sid == "" || !constantTimeEquals(sid, dsClaims.AuthID) {
++		return nil, invalidGrant("The subject_token session does not match the device_secret")
++	}
++	if sub, _ := idClaims["sub"].(string); sub == "" || sub != dsClaims.Subject {
++		return nil, invalidGrant("The subject_token subject does not match the device_secret")
++	}
++
++	// The client that minted the device secret must still be registered for device_sso.
++	if errResp := h.checkOriginalClientDeviceSSO(ctx, dsClaims.ClientID, logger); errResp != nil {
++		return nil, errResp
++	}
++
++	finalScopes, errResp := resolveNativeSSOScopes(tokenRequest.Scope, dsClaims.Scopes, oauthApp)
++	if errResp != nil {
++		return nil, errResp
++	}
++
++	if err := h.deviceSecretProvider.MarkDeviceSecretUsed(ctx, dsClaims, tokenRequest.ClientID); err != nil {
++		if errors.Is(err, providers.ErrDeviceSecretReplayed) {
++			return nil, invalidGrant("The device_secret was already redeemed by this client")
++		}
++		logger.Error(ctx, "Failed to record device secret redemption", log.Error(err))
++		return nil, &model.ErrorResponse{
++			Error:            constants.ErrorServerError,
++			ErrorDescription: "Failed to process token request",
++		}
++	}
++
++	return h.issueNativeSSOTokens(ctx, tokenRequest, oauthApp, dsClaims, finalScopes, jkt, logger)
++}
++
++// validateDeviceSecret invokes the provider and maps its errors: credential problems become
++// invalid_grant, anything else server_error.
++func (h *tokenExchangeGrantHandler) validateDeviceSecret(ctx context.Context, clientID, deviceSecret string,
++	logger *log.Logger) (*providers.DeviceSecretClaims, *model.ErrorResponse) {
++	claims, err := h.deviceSecretProvider.ValidateDeviceSecret(ctx, clientID, deviceSecret)
++	if err != nil {
++		switch {
++		case errors.Is(err, providers.ErrDeviceSecretExpired):
++			return nil, invalidGrant("The device_secret has expired")
++		case errors.Is(err, providers.ErrDeviceSecretRevoked):
++			return nil, invalidGrant("The device_secret session is no longer active")
++		case errors.Is(err, providers.ErrDeviceSecretClientNotPermitted):
++			return nil, invalidGrant("The client is not permitted to use this device_secret")
++		case errors.Is(err, providers.ErrDeviceSecretInvalid):
++			return nil, invalidGrant("Invalid device_secret")
++		default:
++			logger.Error(ctx, "Device secret validation failed unexpectedly", log.Error(err))
++			return nil, &model.ErrorResponse{
++				Error:            constants.ErrorServerError,
++				ErrorDescription: "Failed to process token request",
++			}
++		}
++	}
++	if claims == nil || claims.Subject == "" || claims.ClientID == "" || claims.AuthID == "" ||
++		claims.CnfJkt == "" {
++		return nil, invalidGrant("Invalid device_secret")
++	}
++	return claims, nil
++}
++
++// validateNativeSSOIDToken validates the subject_token as an ID token this server issued to the
++// original client: compact JWS (not JWE), typ JWT, not a refresh token, valid signature, issuer,
++// audience and expiry.
++func (h *tokenExchangeGrantHandler) validateNativeSSOIDToken(ctx context.Context, idToken, originalClientID string,
++	logger *log.Logger) (map[string]interface{}, *model.ErrorResponse) {
++	if strings.Count(idToken, ".") != 2 {
++		return nil, &model.ErrorResponse{
++			Error:            constants.ErrorInvalidRequest,
++			ErrorDescription: "The subject_token must be a signed ID token",
++		}
++	}
++	header, err := jwt.DecodeJWTHeader(idToken)
++	if err != nil {
++		return nil, &model.ErrorResponse{Error: constants.ErrorInvalidRequest, ErrorDescription: "Invalid subject_token"}
++	}
++	if typ, _ := header["typ"].(string); typ != jwt.TokenTypeJWT {
++		return nil, &model.ErrorResponse{
++			Error:            constants.ErrorInvalidRequest,
++			ErrorDescription: "The subject_token is not an ID token",
++		}
++	}
++	claims, err := jwt.DecodeJWTPayload(idToken)
++	if err != nil {
++		return nil, &model.ErrorResponse{Error: constants.ErrorInvalidRequest, ErrorDescription: "Invalid subject_token"}
++	}
++	if _, isRefreshToken := claims["access_token_sub"]; isRefreshToken {
++		return nil, &model.ErrorResponse{
++			Error:            constants.ErrorInvalidRequest,
++			ErrorDescription: "The subject_token is not an ID token",
++		}
++	}
++	if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() >= int64(exp)+h.cfg.JWT.Leeway {
++		return nil, invalidGrant("The subject_token has expired")
++	}
++	if svcErr := h.jwtService.VerifyJWT(ctx, idToken, originalClientID, h.cfg.JWT.Issuer); svcErr != nil {
++		logger.Debug(ctx, "Native SSO subject_token verification failed", log.String("error", svcErr.Code))
++		return nil, invalidGrant("Invalid subject_token")
++	}
++	return claims, nil
++}
++
++// checkOriginalClientDeviceSSO confirms the client the device secret was minted for still exists and
++// still has device_sso among its registered scopes.
++func (h *tokenExchangeGrantHandler) checkOriginalClientDeviceSSO(ctx context.Context, clientID string,
++	logger *log.Logger) *model.ErrorResponse {
++	originalClient, svcErr := h.actorProvider.GetOAuthClientByClientID(ctx, clientID)
++	if svcErr != nil && svcErr.Type == tidcommon.ServerErrorType {
++		logger.Error(ctx, "Failed to load the device_secret's original client", log.String("error", svcErr.Code))
++		return &model.ErrorResponse{
++			Error:            constants.ErrorServerError,
++			ErrorDescription: "Failed to process token request",
++		}
++	}
++	if svcErr != nil || originalClient == nil ||
++		!slices.Contains(originalClient.Scopes, constants.ScopeDeviceSSO) {
++		return invalidGrant("The device_secret's client is no longer authorized for device_sso")
++	}
++	return nil
++}
++
++// resolveNativeSSOScopes decides the scopes the second application receives. With no scope parameter
++// it inherits the original grant. A requested scope must be an OpenID scope, allowed for the
++// requesting client, and part of the original grant: anything beyond the original grant needs the
++// user's consent, so the request fails with interaction_required and the client restarts the
++// browser-based authorization flow.
++func resolveNativeSSOScopes(requestedScope string, grantedScopes []string,
++	oauthApp *providers.OAuthClient) ([]string, *model.ErrorResponse) {
++	granted := withoutScope(grantedScopes, constants.ScopeDeviceSSO)
++	requested := tokenservice.ParseScopes(requestedScope)
++	if len(requested) == 0 {
++		requested = granted
++	}
++
++	if !slices.Contains(requested, constants.ScopeOpenID) {
++		return nil, &model.ErrorResponse{
++			Error:            constants.ErrorInvalidScope,
++			ErrorDescription: "The scope parameter must include openid",
++		}
++	}
++
++	_, permissionScopes := oauth2utils.SeparateOIDCAndNonOIDCScopes(strings.Join(requested, " "),
++		oauthApp.ScopeClaims)
++	if len(permissionScopes) > 0 {
++		return nil, &model.ErrorResponse{
++			Error:            constants.ErrorInvalidScope,
++			ErrorDescription: "Only OpenID Connect scopes can be obtained through Native SSO",
++		}
++	}
++
++	if len(oauthApp.Scopes) > 0 {
++		for _, s := range requested {
++			if s != constants.ScopeOpenID && !slices.Contains(oauthApp.Scopes, s) {
++				return nil, &model.ErrorResponse{
++					Error:            constants.ErrorInvalidScope,
++					ErrorDescription: "The client is not authorized for the requested scope",
++				}
++			}
++		}
++	}
++
++	var notGranted []string
++	for _, s := range requested {
++		if !slices.Contains(granted, s) {
++			notGranted = append(notGranted, s)
++		}
++	}
++	if len(notGranted) > 0 {
++		return nil, &model.ErrorResponse{
++			Error: constants.ErrorInteractionRequired,
++			ErrorDescription: "User consent is required for scopes not granted to the original application: " +
++				strings.Join(notGranted, " "),
++		}
++	}
++	return requested, nil
++}
++
++// issueNativeSSOTokens issues the second application's DPoP-bound access token and ID token. The ID
++// token carries the same sid, since both applications share one authentication session.
++func (h *tokenExchangeGrantHandler) issueNativeSSOTokens(ctx context.Context, tokenRequest *model.TokenRequest,
++	oauthApp *providers.OAuthClient, dsClaims *providers.DeviceSecretClaims, scopes []string, jkt string,
++	logger *log.Logger) (*model.TokenResponseDTO, *model.ErrorResponse) {
++	attrs, attributeCacheID := h.reusableAttributes(ctx, dsClaims, scopes, logger)
++
++	userSubConfig := oauthApp.UserAccessTokenConfig()
++	accessToken, err := h.tokenBuilder.BuildAccessToken(ctx, &tokenservice.AccessTokenBuildContext{
++		Subject:           dsClaims.Subject,
++		Audiences:         []string{oauthApp.ResolveDefaultAudience(tokenRequest.ClientID)},
++		ClientID:          tokenRequest.ClientID,
++		Scopes:            scopes,
++		SubjectAttributes: tokenservice.FilterAttributesByAllowList(attrs, userSubConfig),
++		AttributeCacheID:  attributeCacheID,
++		GrantType:         string(providers.GrantTypeTokenExchange),
++		OAuthApp:          oauthApp,
++		ValidityPeriod:    userSubConfig.ValidityPeriodOrZero(),
++		DPoPJkt:           jkt,
++	})
++	if err != nil {
++		logger.Error(ctx, "Failed to generate Native SSO access token", log.Error(err))
++		return nil, &model.ErrorResponse{Error: constants.ErrorServerError, ErrorDescription: "Failed to generate token"}
++	}
++
++	idToken, err := h.tokenBuilder.BuildIDToken(ctx, &tokenservice.IDTokenBuildContext{
++		Subject:        dsClaims.Subject,
++		Audience:       tokenRequest.ClientID,
++		Scopes:         scopes,
++		UserAttributes: attrs,
++		AuthTime:       dsClaims.AuthTime,
++		OAuthApp:       oauthApp,
++		CompletedACR:   dsClaims.ACR,
++		SessionID:      dsClaims.AuthID,
++	})
++	if err != nil {
++		logger.Error(ctx, "Failed to generate Native SSO ID token", log.Error(err))
++		return nil, &model.ErrorResponse{Error: constants.ErrorServerError, ErrorDescription: "Failed to generate token"}
++	}
++
++	return &model.TokenResponseDTO{AccessToken: *accessToken, IDToken: *idToken}, nil
++}
++
++// reusableAttributes returns the original login's cached user attributes when the second application
++// may receive them. Attributes held as individual claims are filtered per scope downstream, so they
++// are always reusable. An opaque identity-system JWT (providers.RawJWTAttributeKey) cannot be
++// filtered: it is reused only when the second application was granted exactly the original scopes,
++// so a narrower request never receives claims beyond its own scopes.
++func (h *tokenExchangeGrantHandler) reusableAttributes(ctx context.Context, dsClaims *providers.DeviceSecretClaims,
++	scopes []string, logger *log.Logger) (map[string]interface{}, string) {
++	if dsClaims.AttributeCacheID == "" || h.attributeCache == nil {
++		return map[string]interface{}{}, ""
++	}
++	cached, svcErr := h.attributeCache.GetAttributeCache(ctx, dsClaims.AttributeCacheID)
++	if svcErr != nil || cached == nil || cached.Attributes == nil {
++		logger.Debug(ctx, "User attributes of the original login are no longer cached")
++		return map[string]interface{}{}, ""
++	}
++	if _, opaque := cached.Attributes[providers.RawJWTAttributeKey]; opaque &&
++		!sameScopeSet(scopes, withoutScope(dsClaims.Scopes, constants.ScopeDeviceSSO)) {
++		return map[string]interface{}{}, ""
++	}
++	return cached.Attributes, dsClaims.AttributeCacheID
++}
++
++// sameScopeSet reports whether a and b contain the same scopes, ignoring order and duplicates.
++func sameScopeSet(a, b []string) bool {
++	for _, s := range a {
++		if !slices.Contains(b, s) {
++			return false
++		}
++	}
++	for _, s := range b {
++		if !slices.Contains(a, s) {
++			return false
++		}
++	}
++	return true
++}
++
++func invalidGrant(description string) *model.ErrorResponse {
++	return &model.ErrorResponse{Error: constants.ErrorInvalidGrant, ErrorDescription: description}
++}
+diff --git a/backend/internal/oauth/oauth2/granthandlers/native_sso_test.go b/backend/internal/oauth/oauth2/granthandlers/native_sso_test.go
+new file mode 100644
+index 000000000..b3aa6ebf1
+--- /dev/null
++++ b/backend/internal/oauth/oauth2/granthandlers/native_sso_test.go
+@@ -0,0 +1,767 @@
++// Copyright 2026 The ThunderID Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package granthandlers
++
++import (
++	"context"
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/mock"
++	"github.com/stretchr/testify/suite"
++
++	"github.com/thunder-id/thunderid/internal/attributecache"
++	oauthconfig "github.com/thunder-id/thunderid/internal/oauth/config"
++	"github.com/thunder-id/thunderid/internal/oauth/oauth2/authz"
++	"github.com/thunder-id/thunderid/internal/oauth/oauth2/constants"
++	"github.com/thunder-id/thunderid/internal/oauth/oauth2/dpop"
++	"github.com/thunder-id/thunderid/internal/oauth/oauth2/model"
++	"github.com/thunder-id/thunderid/internal/oauth/oauth2/tokenservice"
++	"github.com/thunder-id/thunderid/internal/system/config"
++	tidcommon "github.com/thunder-id/thunderid/pkg/thunderidengine/common"
++	engineconfig "github.com/thunder-id/thunderid/pkg/thunderidengine/config"
++	"github.com/thunder-id/thunderid/pkg/thunderidengine/providers"
++	"github.com/thunder-id/thunderid/tests/mocks/actorprovidermock"
++	"github.com/thunder-id/thunderid/tests/mocks/attributecachemock"
++	"github.com/thunder-id/thunderid/tests/mocks/devicesecretprovidermock"
++	"github.com/thunder-id/thunderid/tests/mocks/jose/jwtmock"
++	"github.com/thunder-id/thunderid/tests/mocks/oauth/oauth2/authzmock"
++	"github.com/thunder-id/thunderid/tests/mocks/oauth/oauth2/tokenservicemock"
++	"github.com/thunder-id/thunderid/tests/mocks/resourcemock"
++)
++
++const (
++	nssoIssuer        = "https://esignet.example.com"
++	nssoSuperClientID = "super-app"
++	nssoChildClientID = "child-app"
++	nssoJKT           = "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"
++	nssoOtherJKT      = "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
++	nssoAuthID        = "3f5b8a52-3b9c-4bd1-9f3e-6c1b2b4c0a11"
++	nssoDeviceSecret  = "eyJhbGciOiJSU0EtT0FFUC0yNTYifQ.k.iv.ct.tag"
++	nssoCacheID       = "attr-cache-1"
++)
++
++// NativeSSOTestSuite covers OpenID Connect Native SSO: device secret issuance on the
++// authorization_code grant and the device-secret token exchange.
++type NativeSSOTestSuite struct {
++	suite.Suite
++	mockTokenBuilder   *tokenservicemock.TokenBuilderInterfaceMock
++	mockAuthzService   *authzmock.AuthorizeServiceInterfaceMock
++	mockAttrCache      *attributecachemock.AttributeCacheServiceInterfaceMock
++	mockResource       *resourcemock.ResourceServiceInterfaceMock
++	mockDeviceSecret   *devicesecretprovidermock.DeviceSecretProviderMock
++	mockJWTService     *jwtmock.JWTServiceInterfaceMock
++	mockActorProvider  *actorprovidermock.ActorProviderMock
++	superApp           *providers.OAuthClient
++	childApp           *providers.OAuthClient
++	authCodeHandler    *authorizationCodeGrantHandler
++	tokenExchangeHandl *tokenExchangeGrantHandler
++	dsClaims           *providers.DeviceSecretClaims
++}
++
++func TestNativeSSOTestSuite(t *testing.T) {
++	suite.Run(t, new(NativeSSOTestSuite))
++}
++
++func (s *NativeSSOTestSuite) SetupTest() {
++	_ = config.InitializeServerRuntime("test", &config.Config{
++		JWT: engineconfig.JWTConfig{ValidityPeriod: 3600},
++	})
++
++	s.mockTokenBuilder = tokenservicemock.NewTokenBuilderInterfaceMock(s.T())
++	s.mockAuthzService = authzmock.NewAuthorizeServiceInterfaceMock(s.T())
++	s.mockAttrCache = attributecachemock.NewAttributeCacheServiceInterfaceMock(s.T())
++	s.mockResource = resourcemock.NewResourceServiceInterfaceMock(s.T())
++	s.mockDeviceSecret = devicesecretprovidermock.NewDeviceSecretProviderMock(s.T())
++	s.mockJWTService = jwtmock.NewJWTServiceInterfaceMock(s.T())
++	s.mockActorProvider = actorprovidermock.NewActorProviderMock(s.T())
++
++	scopeClaims := map[string][]string{
++		"profile": {"name"},
++		"email":   {"email"},
++	}
++	s.superApp = &providers.OAuthClient{
++		ClientID:    nssoSuperClientID,
++		GrantTypes:  []providers.GrantType{providers.GrantTypeAuthorizationCode},
++		Scopes:      []string{"email", "profile", constants.ScopeDeviceSSO},
++		ScopeClaims: scopeClaims,
++	}
++	s.childApp = &providers.OAuthClient{
++		ClientID:    nssoChildClientID,
++		GrantTypes:  []providers.GrantType{providers.GrantTypeTokenExchange},
++		Scopes:      []string{"email", "profile"},
++		ScopeClaims: scopeClaims,
++	}
++
++	s.authCodeHandler = &authorizationCodeGrantHandler{
++		authzService:         s.mockAuthzService,
++		tokenBuilder:         s.mockTokenBuilder,
++		attributeCache:       s.mockAttrCache,
++		resourceService:      s.mockResource,
++		deviceSecretProvider: s.mockDeviceSecret,
++	}
++	s.tokenExchangeHandl = &tokenExchangeGrantHandler{
++		tokenBuilder:         s.mockTokenBuilder,
++		resourceService:      s.mockResource,
++		actorProvider:        s.mockActorProvider,
++		jwtService:           s.mockJWTService,
++		attributeCache:       s.mockAttrCache,
++		deviceSecretProvider: s.mockDeviceSecret,
++		cfg:                  oauthconfig.Config{JWT: engineconfig.JWTConfig{Issuer: nssoIssuer, Leeway: 0}},
++	}
++	s.dsClaims = &providers.DeviceSecretClaims{
++		JTI:              "ds-jti",
++		Issuer:           nssoIssuer,
++		Subject:          testUserID,
++		AuthID:           nssoAuthID,
++		ClientID:         nssoSuperClientID,
++		Scopes:           []string{"openid", "email"},
++		ACR:              "mosip:idp:acr:generated-code",
++		Claims:           []string{"email"},
++		AuthTime:         time.Now().Add(-time.Minute).Unix(),
++		CnfJkt:           nssoJKT,
++		AttributeCacheID: nssoCacheID,
++		ExpiresAt:        time.Now().Add(time.Hour).Unix(),
++	}
++}
++
++// ---------------------------------------------------------------------------------------------------
++// helpers
++// ---------------------------------------------------------------------------------------------------
++
++func dpopCtx(jkt string) context.Context {
++	return dpop.WithJkt(context.Background(), jkt)
++}
++
++// fakeIDToken builds a compact JWS with the given claims. Signature verification is the JWT
++// service's responsibility and is mocked here; the handler only parses header and payload itself.
++func fakeIDToken(typ string, claims map[string]interface{}) string {
++	h, _ := json.Marshal(map[string]string{"alg": "ES256", "typ": typ})
++	p, _ := json.Marshal(claims)
++	return base64.RawURLEncoding.EncodeToString(h) + "." + base64.RawURLEncoding.EncodeToString(p) + ".sig"
++}
++
++func (s *NativeSSOTestSuite) superIDTokenClaims() map[string]interface{} {
++	return map[string]interface{}{
++		"iss":                           nssoIssuer,
++		"sub":                           testUserID,
++		"aud":                           nssoSuperClientID,
++		"exp":                           float64(time.Now().Add(time.Hour).Unix()),
++		"iat":                           float64(time.Now().Unix()),
++		constants.ClaimSessionID:        nssoAuthID,
++		constants.ClaimDeviceSecretHash: computeDeviceSecretHash(nssoDeviceSecret),
++	}
++}
++
++func (s *NativeSSOTestSuite) exchangeRequest(idToken, scope string) *model.TokenRequest {
++	return &model.TokenRequest{
++		GrantType:        string(providers.GrantTypeTokenExchange),
++		ClientID:         nssoChildClientID,
++		SubjectToken:     idToken,
++		SubjectTokenType: string(constants.TokenTypeIdentifierIDToken),
++		ActorToken:       nssoDeviceSecret,
++		ActorTokenType:   string(constants.TokenTypeIdentifierDeviceSecret),
++		Audiences:        []string{nssoIssuer},
++		Scope:            scope,
++	}
++}
++
++func (s *NativeSSOTestSuite) expectValidDeviceSecret() {
++	s.mockDeviceSecret.On("ValidateDeviceSecret", mock.Anything, nssoChildClientID, nssoDeviceSecret).
++		Return(s.dsClaims, nil).Once()
++}
++
++func (s *NativeSSOTestSuite) expectValidIDTokenSignature(idToken string) {
++	s.mockJWTService.On("VerifyJWT", mock.Anything, idToken, nssoSuperClientID, nssoIssuer).
++		Return((*tidcommon.ServiceError)(nil)).Once()
++}
++
++func (s *NativeSSOTestSuite) expectOriginalClientDeviceSSO() {
++	s.mockActorProvider.On("GetOAuthClientByClientID", mock.Anything, nssoSuperClientID).
++		Return(s.superApp, (*tidcommon.ServiceError)(nil)).Once()
++}
++
++func (s *NativeSSOTestSuite) expectIssuance() (*providers.DeviceSecretClaims, *[]string) {
++	s.mockDeviceSecret.On("MarkDeviceSecretUsed", mock.Anything, s.dsClaims, nssoChildClientID).
++		Return(nil).Once()
++	s.mockAttrCache.On("GetAttributeCache", mock.Anything, nssoCacheID).
++		Return(&attributecache.AttributeCache{ID: nssoCacheID,
++			Attributes: map[string]interface{}{"email": "user@example.com"}}, (*tidcommon.ServiceError)(nil)).Once()
++	var accessScopes []string
++	s.mockTokenBuilder.On("BuildAccessToken", mock.Anything, mock.MatchedBy(
++		func(c *tokenservice.AccessTokenBuildContext) bool {
++			accessScopes = c.Scopes
++			return c.Subject == testUserID && c.ClientID == nssoChildClientID && c.DPoPJkt == nssoJKT &&
++				c.AttributeCacheID == nssoCacheID &&
++				c.GrantType == string(providers.GrantTypeTokenExchange)
++		})).Return(&model.TokenDTO{Token: "child-at", Scopes: []string{"openid", "email"}}, nil).Once()
++	s.mockTokenBuilder.On("BuildIDToken", mock.Anything, mock.MatchedBy(
++		func(c *tokenservice.IDTokenBuildContext) bool {
++			return c.Audience == nssoChildClientID && c.SessionID == nssoAuthID && c.DeviceSecretHash == "" &&
++				c.CompletedACR == s.dsClaims.ACR && c.Subject == testUserID
++		})).Return(&model.TokenDTO{Token: "child-idt"}, nil).Once()
++	return s.dsClaims, &accessScopes
++}
++
++func (s *NativeSSOTestSuite) assertError(errResp *model.ErrorResponse, code string) {
++	s.Require().NotNil(errResp)
++	s.Equal(code, errResp.Error)
++}
++
++// ---------------------------------------------------------------------------------------------------
++// ds_hash and scope helpers
++// ---------------------------------------------------------------------------------------------------
++
++func (s *NativeSSOTestSuite) TestComputeDeviceSecretHash() {
++	// SHA-256("abc") = ba7816bf..., base64url without padding.
++	s.Equal("ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0", computeDeviceSecretHash("abc"))
++	s.NotEqual(computeDeviceSecretHash("abc"), computeDeviceSecretHash("abd"))
++}
++
++func (s *NativeSSOTestSuite) TestResolveNativeSSOScopes() {
++	granted := []string{"openid", "email", "profile", constants.ScopeDeviceSSO}
++
++	got, errResp := resolveNativeSSOScopes("", granted, s.childApp)
++	s.Nil(errResp)
++	s.Equal([]string{"openid", "email", "profile"}, got, "no scope inherits the grant without device_sso")
++
++	got, errResp = resolveNativeSSOScopes("openid email", granted, s.childApp)
++	s.Nil(errResp)
++	s.Equal([]string{"openid", "email"}, got, "a narrower scope is allowed")
++
++	_, errResp = resolveNativeSSOScopes("openid email profile",
++		[]string{"openid", "email"}, s.childApp)
++	s.assertError(errResp, constants.ErrorInteractionRequired)
++	s.Contains(errResp.ErrorDescription, "profile")
++
++	_, errResp = resolveNativeSSOScopes("email", granted, s.childApp)
++	s.assertError(errResp, constants.ErrorInvalidScope)
++
++	_, errResp = resolveNativeSSOScopes("openid payments:write", granted, s.childApp)
++	s.assertError(errResp, constants.ErrorInvalidScope)
++
++	restricted := *s.childApp
++	restricted.Scopes = []string{"email"}
++	_, errResp = resolveNativeSSOScopes("openid profile", granted, &restricted)
++	s.assertError(errResp, constants.ErrorInvalidScope)
++}
++
++// ---------------------------------------------------------------------------------------------------
++// authorization_code grant: device secret issuance
++// ---------------------------------------------------------------------------------------------------
++
++func (s *NativeSSOTestSuite) authCode(scopes string) *authz.AuthorizationCode {
++	return &authz.AuthorizationCode{
++		Code:             "code-1",
++		ClientID:         nssoSuperClientID,
++		AuthorizedUserID: testUserID,
++		AttributeCacheID: nssoCacheID,
++		TimeCreated:      time.Now().Add(-time.Minute),
++		ExpiryTime:       time.Now().Add(time.Minute),
++		Scopes:           scopes,
++		CompletedACR:     "mosip:idp:acr:generated-code",
++		DPoPJkt:          nssoJKT,
++	}
++}
++
++func (s *NativeSSOTestSuite) codeRequest() *model.TokenRequest {
++	return &model.TokenRequest{
++		GrantType: string(providers.GrantTypeAuthorizationCode),
++		ClientID:  nssoSuperClientID,
++		Code:      "code-1",
++	}
++}
++
++func (s *NativeSSOTestSuite) TestAuthorizationCode_DeviceSSO_IssuesDeviceSecret() {
++	s.mockAuthzService.On("GetAuthorizationCodeDetails", mock.Anything, nssoSuperClientID, "code-1").
++		Return(s.authCode("openid email device_sso"), nil).Once()
++	s.mockAttrCache.On("GetAttributeCache", mock.Anything, nssoCacheID).
++		Return(&attributecache.AttributeCache{ID: nssoCacheID,
++			Attributes: map[string]interface{}{"email": "user@example.com"}}, (*tidcommon.ServiceError)(nil)).Once()
++	s.mockTokenBuilder.On("BuildAccessToken", mock.Anything, mock.Anything).
++		Return(&model.TokenDTO{Token: "at"}, nil).Once()
++
++	var dsReq *providers.DeviceSecretRequest
++	s.mockDeviceSecret.On("GenerateDeviceSecret", mock.Anything, mock.MatchedBy(
++		func(r *providers.DeviceSecretRequest) bool { dsReq = r; return true })).
++		Return(&providers.DeviceSecret{Value: nssoDeviceSecret,
++			ExpiresAt: time.Now().Add(time.Hour).Unix()}, nil).Once()
++	s.mockAttrCache.On("ExtendAttributeCacheTTL", mock.Anything, nssoCacheID,
++		mock.MatchedBy(func(ttl int) bool { return ttl > 3600 && ttl <= 3600+constants.AttributeCacheTTLBufferSeconds })).
++		Return((*tidcommon.ServiceError)(nil)).Once()
++
++	var idCtx *tokenservice.IDTokenBuildContext
++	s.mockTokenBuilder.On("BuildIDToken", mock.Anything, mock.MatchedBy(
++		func(c *tokenservice.IDTokenBuildContext) bool { idCtx = c; return true })).
++		Return(&model.TokenDTO{Token: "idt"}, nil).Once()
++
++	resp, errResp := s.authCodeHandler.HandleGrant(dpopCtx(nssoJKT), s.codeRequest(), s.superApp)
++
++	s.Require().Nil(errResp)
++	s.Equal(nssoDeviceSecret, resp.DeviceSecret)
++	s.Require().NotNil(dsReq)
++	s.Equal(testUserID, dsReq.Subject)
++	s.Equal(nssoSuperClientID, dsReq.ClientID)
++	s.Equal([]string{"openid", "email"}, dsReq.Scopes, "device_sso is not carried into the device secret")
++	s.Equal(nssoJKT, dsReq.CnfJkt)
++	s.Equal("mosip:idp:acr:generated-code", dsReq.ACR)
++	s.Equal([]string{"email", "sub"}, dsReq.Claims)
++	s.Equal(nssoCacheID, dsReq.AttributeCacheID)
++	s.NotEmpty(dsReq.AuthID)
++	s.Require().NotNil(idCtx)
++	s.Equal(dsReq.AuthID, idCtx.SessionID, "sid equals the device secret's auth_id")
++	s.Equal(computeDeviceSecretHash(nssoDeviceSecret), idCtx.DeviceSecretHash)
++}
++
++func (s *NativeSSOTestSuite) TestAuthorizationCode_WithoutDeviceSSO_IsUnchanged() {
++	code := s.authCode("openid email")
++	code.AttributeCacheID = ""
++	s.mockAuthzService.On("GetAuthorizationCodeDetails", mock.Anything, nssoSuperClientID, "code-1").
++		Return(code, nil).Once()
++	s.mockTokenBuilder.On("BuildAccessToken", mock.Anything, mock.Anything).
++		Return(&model.TokenDTO{Token: "at"}, nil).Once()
++	s.mockTokenBuilder.On("BuildIDToken", mock.Anything, mock.MatchedBy(
++		func(c *tokenservice.IDTokenBuildContext) bool { return c.SessionID == "" && c.DeviceSecretHash == "" })).
++		Return(&model.TokenDTO{Token: "idt"}, nil).Once()
++
++	resp, errResp := s.authCodeHandler.HandleGrant(dpopCtx(nssoJKT), s.codeRequest(), s.superApp)
++
++	s.Require().Nil(errResp)
++	s.Empty(resp.DeviceSecret)
++	s.mockDeviceSecret.AssertNotCalled(s.T(), "GenerateDeviceSecret", mock.Anything, mock.Anything)
++}
++
++func (s *NativeSSOTestSuite) TestAuthorizationCode_DeviceSSO_Rejections() {
++	cases := []struct {
++		name     string
++		scopes   string
++		app      func() *providers.OAuthClient
++		provider bool
++		ctx      context.Context
++		wantErr  string
++	}{
++		{"client not registered for device_sso", "openid email device_sso", func() *providers.OAuthClient {
++			app := *s.superApp
++			app.Scopes = []string{"email"}
++			return &app
++		}, true, dpopCtx(nssoJKT), constants.ErrorInvalidScope},
++		{"server without provider", "openid email device_sso", func() *providers.OAuthClient { return s.superApp },
++			false, dpopCtx(nssoJKT), constants.ErrorInvalidScope},
++		{"device_sso without openid", "email device_sso", func() *providers.OAuthClient { return s.superApp },
++			true, dpopCtx(nssoJKT), constants.ErrorInvalidScope},
++		{"no DPoP proof", "openid email device_sso", func() *providers.OAuthClient { return s.superApp },
++			true, context.Background(), constants.ErrorInvalidDPoPProof},
++	}
++	for _, tc := range cases {
++		s.Run(tc.name, func() {
++			code := s.authCode(tc.scopes)
++			if tc.ctx == context.Background() {
++				code.DPoPJkt = ""
++			}
++			authzSvc := authzmock.NewAuthorizeServiceInterfaceMock(s.T())
++			authzSvc.On("GetAuthorizationCodeDetails", mock.Anything, nssoSuperClientID, "code-1").
++				Return(code, nil).Once()
++			builder := tokenservicemock.NewTokenBuilderInterfaceMock(s.T())
++			h := &authorizationCodeGrantHandler{authzService: authzSvc, tokenBuilder: builder,
++				attributeCache: s.mockAttrCache, resourceService: s.mockResource}
++			if tc.provider {
++				h.deviceSecretProvider = s.mockDeviceSecret
++			}
++
++			resp, errResp := h.HandleGrant(tc.ctx, s.codeRequest(), tc.app())
++
++			s.Nil(resp)
++			s.assertError(errResp, tc.wantErr)
++			builder.AssertNotCalled(s.T(), "BuildAccessToken", mock.Anything, mock.Anything)
++		})
++	}
++}
++
++func (s *NativeSSOTestSuite) TestAuthorizationCode_DeviceSSO_ProviderFailure() {
++	s.mockAuthzService.On("GetAuthorizationCodeDetails", mock.Anything, nssoSuperClientID, "code-1").
++		Return(s.authCode("openid email device_sso"), nil).Once()
++	s.mockAttrCache.On("GetAttributeCache", mock.Anything, nssoCacheID).
++		Return(&attributecache.AttributeCache{ID: nssoCacheID, Attributes: map[string]interface{}{}},
++			(*tidcommon.ServiceError)(nil)).Once()
++	s.mockTokenBuilder.On("BuildAccessToken", mock.Anything, mock.Anything).
++		Return(&model.TokenDTO{Token: "at"}, nil).Once()
++	s.mockDeviceSecret.On("GenerateDeviceSecret", mock.Anything, mock.Anything).
++		Return(nil, errors.New("keystore unavailable")).Once()
++
++	resp, errResp := s.authCodeHandler.HandleGrant(dpopCtx(nssoJKT), s.codeRequest(), s.superApp)
++
++	s.Nil(resp)
++	s.assertError(errResp, constants.ErrorServerError)
++	s.mockTokenBuilder.AssertNotCalled(s.T(), "BuildIDToken", mock.Anything, mock.Anything)
++}
++
++// ---------------------------------------------------------------------------------------------------
++// token exchange: request validation
++// ---------------------------------------------------------------------------------------------------
++
++func (s *NativeSSOTestSuite) TestValidateGrant_NativeSSO() {
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++
++	s.Nil(s.tokenExchangeHandl.ValidateGrant(context.Background(), s.exchangeRequest(idToken, "openid email"),
++		s.childApp))
++
++	req := s.exchangeRequest(idToken, "openid email device_sso")
++	s.assertError(s.tokenExchangeHandl.ValidateGrant(context.Background(), req, s.childApp),
++		constants.ErrorInvalidScope)
++
++	req = s.exchangeRequest(idToken, "openid")
++	req.SubjectTokenType = string(constants.TokenTypeIdentifierAccessToken)
++	s.assertError(s.tokenExchangeHandl.ValidateGrant(context.Background(), req, s.childApp),
++		constants.ErrorInvalidRequest)
++
++	req = s.exchangeRequest(idToken, "openid")
++	req.SubjectTokenType = string(constants.TokenTypeIdentifierDeviceSecret)
++	s.assertError(s.tokenExchangeHandl.ValidateGrant(context.Background(), req, s.childApp),
++		constants.ErrorInvalidRequest)
++
++	req = s.exchangeRequest(idToken, "openid")
++	req.RequestedTokenType = string(constants.TokenTypeIdentifierJWT)
++	s.assertError(s.tokenExchangeHandl.ValidateGrant(context.Background(), req, s.childApp),
++		constants.ErrorInvalidRequest)
++
++	req = s.exchangeRequest(idToken, "openid")
++	req.ActorToken = ""
++	s.assertError(s.tokenExchangeHandl.ValidateGrant(context.Background(), req, s.childApp),
++		constants.ErrorInvalidRequest)
++
++	req = s.exchangeRequest("", "openid")
++	s.assertError(s.tokenExchangeHandl.ValidateGrant(context.Background(), req, s.childApp),
++		constants.ErrorInvalidRequest)
++
++	req = s.exchangeRequest(idToken, "openid")
++	req.Resources = []string{"https://api.example.com"}
++	s.assertError(s.tokenExchangeHandl.ValidateGrant(context.Background(), req, s.childApp),
++		constants.ErrorInvalidTarget)
++}
++
++// ---------------------------------------------------------------------------------------------------
++// token exchange: success paths
++// ---------------------------------------------------------------------------------------------------
++
++func (s *NativeSSOTestSuite) TestNativeSSO_Success() {
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++	s.expectValidDeviceSecret()
++	s.expectValidIDTokenSignature(idToken)
++	s.expectOriginalClientDeviceSSO()
++	_, accessScopes := s.expectIssuance()
++
++	resp, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
++		s.exchangeRequest(idToken, "openid email"), s.childApp)
++
++	s.Require().Nil(errResp)
++	s.Equal("child-at", resp.AccessToken.Token)
++	s.Equal("child-idt", resp.IDToken.Token)
++	s.Empty(resp.DeviceSecret, "the device secret is not re-issued")
++	s.Equal([]string{"openid", "email"}, *accessScopes)
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_ScopeOmittedInheritsGrant() {
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++	s.expectValidDeviceSecret()
++	s.expectValidIDTokenSignature(idToken)
++	s.expectOriginalClientDeviceSSO()
++	_, accessScopes := s.expectIssuance()
++
++	_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT), s.exchangeRequest(idToken, ""), s.childApp)
++
++	s.Require().Nil(errResp)
++	s.Equal([]string{"openid", "email"}, *accessScopes)
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_NarrowerScope() {
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++	s.expectValidDeviceSecret()
++	s.expectValidIDTokenSignature(idToken)
++	s.expectOriginalClientDeviceSSO()
++	_, accessScopes := s.expectIssuance()
++
++	_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT), s.exchangeRequest(idToken, "openid"),
++		s.childApp)
++
++	s.Require().Nil(errResp)
++	s.Equal([]string{"openid"}, *accessScopes)
++}
++
++// ---------------------------------------------------------------------------------------------------
++// token exchange: rejections
++// ---------------------------------------------------------------------------------------------------
++
++func (s *NativeSSOTestSuite) TestNativeSSO_ScopeBeyondGrantNeedsConsent() {
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++	s.expectValidDeviceSecret()
++	s.expectValidIDTokenSignature(idToken)
++	s.expectOriginalClientDeviceSSO()
++
++	_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
++		s.exchangeRequest(idToken, "openid email profile"), s.childApp)
++
++	s.assertError(errResp, constants.ErrorInteractionRequired)
++	s.mockDeviceSecret.AssertNotCalled(s.T(), "MarkDeviceSecretUsed", mock.Anything, mock.Anything, mock.Anything)
++	s.mockTokenBuilder.AssertNotCalled(s.T(), "BuildAccessToken", mock.Anything, mock.Anything)
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_MissingDPoPProof() {
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++
++	_, errResp := s.tokenExchangeHandl.HandleGrant(context.Background(),
++		s.exchangeRequest(idToken, "openid"), s.childApp)
++
++	s.assertError(errResp, constants.ErrorInvalidDPoPProof)
++	s.mockDeviceSecret.AssertNotCalled(s.T(), "ValidateDeviceSecret", mock.Anything, mock.Anything, mock.Anything)
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_DPoPKeyMismatch() {
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++	s.expectValidDeviceSecret()
++
++	_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoOtherJKT),
++		s.exchangeRequest(idToken, "openid"), s.childApp)
++
++	s.assertError(errResp, constants.ErrorInvalidGrant)
++	s.Contains(errResp.ErrorDescription, "DPoP")
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_AudienceMustBeIssuer() {
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++	for _, aud := range [][]string{nil, {"https://other.example.com"}, {nssoIssuer, "x"}} {
++		req := s.exchangeRequest(idToken, "openid")
++		req.Audiences = aud
++		_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT), req, s.childApp)
++		s.assertError(errResp, constants.ErrorInvalidTarget)
++	}
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_DeviceSecretProviderErrors() {
++	cases := []struct {
++		err     error
++		wantErr string
++	}{
++		{providers.ErrDeviceSecretExpired, constants.ErrorInvalidGrant},
++		{providers.ErrDeviceSecretInvalid, constants.ErrorInvalidGrant},
++		{providers.ErrDeviceSecretRevoked, constants.ErrorInvalidGrant},
++		{providers.ErrDeviceSecretClientNotPermitted, constants.ErrorInvalidGrant},
++		{errors.New("wrapped: " + providers.ErrDeviceSecretInvalid.Error()), constants.ErrorServerError},
++		{errors.Join(errors.New("decrypt"), providers.ErrDeviceSecretInvalid), constants.ErrorInvalidGrant},
++	}
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++	for _, tc := range cases {
++		s.Run(tc.err.Error(), func() {
++			s.mockDeviceSecret.On("ValidateDeviceSecret", mock.Anything, nssoChildClientID, nssoDeviceSecret).
++				Return(nil, tc.err).Once()
++			_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
++				s.exchangeRequest(idToken, "openid"), s.childApp)
++			s.assertError(errResp, tc.wantErr)
++		})
++	}
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_IncompleteDeviceSecretClaims() {
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++	incomplete := *s.dsClaims
++	incomplete.CnfJkt = ""
++	s.mockDeviceSecret.On("ValidateDeviceSecret", mock.Anything, nssoChildClientID, nssoDeviceSecret).
++		Return(&incomplete, nil).Once()
++
++	_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT), s.exchangeRequest(idToken, "openid"),
++		s.childApp)
++
++	s.assertError(errResp, constants.ErrorInvalidGrant)
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_IDTokenBindingFailures() {
++	cases := []struct {
++		name   string
++		mutate func(map[string]interface{})
++	}{
++		{"wrong ds_hash", func(c map[string]interface{}) {
++			c[constants.ClaimDeviceSecretHash] = computeDeviceSecretHash("another-secret")
++		}},
++		{"missing ds_hash", func(c map[string]interface{}) { delete(c, constants.ClaimDeviceSecretHash) }},
++		{"wrong sid", func(c map[string]interface{}) { c[constants.ClaimSessionID] = "other-session" }},
++		{"missing sid", func(c map[string]interface{}) { delete(c, constants.ClaimSessionID) }},
++		{"wrong sub", func(c map[string]interface{}) { c["sub"] = "someone-else" }},
++	}
++	for _, tc := range cases {
++		s.Run(tc.name, func() {
++			claims := s.superIDTokenClaims()
++			tc.mutate(claims)
++			idToken := fakeIDToken("JWT", claims)
++			s.expectValidDeviceSecret()
++			s.expectValidIDTokenSignature(idToken)
++
++			_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
++				s.exchangeRequest(idToken, "openid"), s.childApp)
++
++			s.assertError(errResp, constants.ErrorInvalidGrant)
++		})
++	}
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_IDTokenValidationFailures() {
++	s.Run("invalid signature or issuer", func() {
++		idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++		s.expectValidDeviceSecret()
++		s.mockJWTService.On("VerifyJWT", mock.Anything, idToken, nssoSuperClientID, nssoIssuer).
++			Return(&tidcommon.ServiceError{Code: "JWT-1001"}).Once()
++		_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
++			s.exchangeRequest(idToken, "openid"), s.childApp)
++		s.assertError(errResp, constants.ErrorInvalidGrant)
++	})
++	s.Run("expired", func() {
++		claims := s.superIDTokenClaims()
++		claims["exp"] = float64(time.Now().Add(-time.Minute).Unix())
++		s.expectValidDeviceSecret()
++		_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
++			s.exchangeRequest(fakeIDToken("JWT", claims), "openid"), s.childApp)
++		s.assertError(errResp, constants.ErrorInvalidGrant)
++		s.Contains(errResp.ErrorDescription, "expired")
++	})
++	s.Run("encrypted (JWE) ID token", func() {
++		s.expectValidDeviceSecret()
++		_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
++			s.exchangeRequest("a.b.c.d.e", "openid"), s.childApp)
++		s.assertError(errResp, constants.ErrorInvalidRequest)
++	})
++	s.Run("access token presented as ID token", func() {
++		s.expectValidDeviceSecret()
++		_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
++			s.exchangeRequest(fakeIDToken("at+jwt", s.superIDTokenClaims()), "openid"), s.childApp)
++		s.assertError(errResp, constants.ErrorInvalidRequest)
++	})
++	s.Run("refresh token presented as ID token", func() {
++		claims := s.superIDTokenClaims()
++		claims["access_token_sub"] = testUserID
++		s.expectValidDeviceSecret()
++		_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
++			s.exchangeRequest(fakeIDToken("JWT", claims), "openid"), s.childApp)
++		s.assertError(errResp, constants.ErrorInvalidRequest)
++	})
++	s.Run("malformed", func() {
++		s.expectValidDeviceSecret()
++		_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
++			s.exchangeRequest("!!.@@.##", "openid"), s.childApp)
++		s.assertError(errResp, constants.ErrorInvalidRequest)
++	})
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_OriginalClientLostDeviceSSO() {
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++	s.expectValidDeviceSecret()
++	s.expectValidIDTokenSignature(idToken)
++	revoked := *s.superApp
++	revoked.Scopes = []string{"email"}
++	s.mockActorProvider.On("GetOAuthClientByClientID", mock.Anything, nssoSuperClientID).
++		Return(&revoked, (*tidcommon.ServiceError)(nil)).Once()
++
++	_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT), s.exchangeRequest(idToken, "openid"),
++		s.childApp)
++
++	s.assertError(errResp, constants.ErrorInvalidGrant)
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_OriginalClientLookupServerError() {
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++	s.expectValidDeviceSecret()
++	s.expectValidIDTokenSignature(idToken)
++	s.mockActorProvider.On("GetOAuthClientByClientID", mock.Anything, nssoSuperClientID).
++		Return(nil, &tidcommon.ServiceError{Type: tidcommon.ServerErrorType, Code: "X"}).Once()
++
++	_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT), s.exchangeRequest(idToken, "openid"),
++		s.childApp)
++
++	s.assertError(errResp, constants.ErrorServerError)
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_Replay() {
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++	s.expectValidDeviceSecret()
++	s.expectValidIDTokenSignature(idToken)
++	s.expectOriginalClientDeviceSSO()
++	s.mockDeviceSecret.On("MarkDeviceSecretUsed", mock.Anything, s.dsClaims, nssoChildClientID).
++		Return(providers.ErrDeviceSecretReplayed).Once()
++
++	_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT), s.exchangeRequest(idToken, "openid"),
++		s.childApp)
++
++	s.assertError(errResp, constants.ErrorInvalidGrant)
++	s.mockTokenBuilder.AssertNotCalled(s.T(), "BuildAccessToken", mock.Anything, mock.Anything)
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_NotSupportedWithoutProvider() {
++	h := *s.tokenExchangeHandl
++	h.deviceSecretProvider = nil
++	_, errResp := h.HandleGrant(dpopCtx(nssoJKT),
++		s.exchangeRequest(fakeIDToken("JWT", s.superIDTokenClaims()), "openid"), s.childApp)
++	s.assertError(errResp, constants.ErrorInvalidRequest)
++}
++
++func (s *NativeSSOTestSuite) TestNativeSSO_ErrorDescriptionsDoNotLeakSecrets() {
++	idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++	s.expectValidDeviceSecret()
++
++	_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoOtherJKT),
++		s.exchangeRequest(idToken, "openid"), s.childApp)
++
++	s.Require().NotNil(errResp)
++	s.False(strings.Contains(errResp.ErrorDescription, nssoDeviceSecret))
++	s.False(strings.Contains(errResp.ErrorDescription, nssoJKT))
++	s.False(strings.Contains(errResp.ErrorDescription, idToken))
++}
++
++func (s *NativeSSOTestSuite) TestConsentedClaimNames() {
++	claimsReq := &model.ClaimsRequest{
++		UserInfo: map[string]*model.IndividualClaimRequest{"phone_number": nil},
++		IDToken:  map[string]*model.IndividualClaimRequest{"birthdate": nil},
++	}
++	got := consentedClaimNames([]string{"openid", "email", constants.ScopeDeviceSSO}, claimsReq,
++		map[string][]string{"email": {"email"}},
++		map[string]interface{}{"email": "a@b.c", "gender": "x", providers.RawJWTAttributeKey: "jwt"})
++	s.Equal([]string{"birthdate", "email", "gender", "phone_number", "sub"}, got)
++}
++
++// An opaque identity-system JWT cannot be filtered per scope, so a narrower second application must
++// not inherit it; an identical scope set may.
++func (s *NativeSSOTestSuite) TestNativeSSO_OpaqueAttributesOnlyForIdenticalScopes() {
++	for _, tc := range []struct {
++		scope   string
++		wantACI string
++	}{
++		{"openid", ""},
++		{"openid email", nssoCacheID},
++	} {
++		s.Run(tc.scope, func() {
++			s.SetupTest()
++			idToken := fakeIDToken("JWT", s.superIDTokenClaims())
++			s.expectValidDeviceSecret()
++			s.expectValidIDTokenSignature(idToken)
++			s.expectOriginalClientDeviceSSO()
++			s.mockDeviceSecret.On("MarkDeviceSecretUsed", mock.Anything, s.dsClaims, nssoChildClientID).
++				Return(nil).Once()
++			s.mockAttrCache.On("GetAttributeCache", mock.Anything, nssoCacheID).
++				Return(&attributecache.AttributeCache{ID: nssoCacheID, Attributes: map[string]interface{}{
++					providers.RawJWTAttributeKey: "kyc.jwt.sig"}}, (*tidcommon.ServiceError)(nil)).Once()
++			var gotACI = "unset"
++			s.mockTokenBuilder.On("BuildAccessToken", mock.Anything, mock.MatchedBy(
++				func(c *tokenservice.AccessTokenBuildContext) bool { gotACI = c.AttributeCacheID; return true })).
++				Return(&model.TokenDTO{Token: "at"}, nil).Once()
++			s.mockTokenBuilder.On("BuildIDToken", mock.Anything, mock.Anything).
++				Return(&model.TokenDTO{Token: "idt"}, nil).Once()
++
++			_, errResp := s.tokenExchangeHandl.HandleGrant(dpopCtx(nssoJKT),
++				s.exchangeRequest(idToken, tc.scope), s.childApp)
++
++			s.Require().Nil(errResp)
++			s.Equal(tc.wantACI, gotACI)
++		})
++	}
++}
+diff --git a/backend/internal/oauth/oauth2/granthandlers/provider.go b/backend/internal/oauth/oauth2/granthandlers/provider.go
+index 6686fbeb6..7cd26b3be 100644
+--- a/backend/internal/oauth/oauth2/granthandlers/provider.go
++++ b/backend/internal/oauth/oauth2/granthandlers/provider.go
+@@ -46,6 +46,7 @@ func newGrantHandlerProvider(
+ 	cibaService ciba.CIBAServiceInterface,
+ 	refreshTokenRevoker revocation.RefreshTokenRevokerInterface,
+ 	criteriaRevoker revocation.CriteriaRevokerInterface,
++	deviceSecretProvider providers.DeviceSecretProvider,
+ 	cfg oauthconfig.Config,
+ ) GrantHandlerProviderInterface {
+ 	allowedGrantTypes := cfg.OAuth.AllowedGrantTypes
+@@ -56,7 +57,7 @@ func newGrantHandlerProvider(
+ 	}
+ 	if isGrantTypeAllowed(allowedGrantTypes, providers.GrantTypeAuthorizationCode) {
+ 		grantProvider.authorizationCodeGrantHandler = newAuthorizationCodeGrantHandler(
+-			authzService, tokenBuilder, attrCacheService, resourceService)
++			authzService, tokenBuilder, attrCacheService, resourceService, deviceSecretProvider)
+ 	}
+ 	if isGrantTypeAllowed(allowedGrantTypes, providers.GrantTypeRefreshToken) {
+ 		grantProvider.refreshTokenGrantHandler = newRefreshTokenGrantHandler(
+@@ -65,7 +66,8 @@ func newGrantHandlerProvider(
+ 	}
+ 	if isGrantTypeAllowed(allowedGrantTypes, providers.GrantTypeTokenExchange) {
+ 		grantProvider.tokenExchangeGrantHandler = newTokenExchangeGrantHandler(
+-			tokenBuilder, tokenValidator, resourceService, rbacAuthzService, actorProvider, cfg)
++			tokenBuilder, tokenValidator, resourceService, rbacAuthzService, actorProvider, cfg,
++			jwtService, attrCacheService, deviceSecretProvider)
+ 	}
+ 	if isGrantTypeAllowed(allowedGrantTypes, providers.GrantTypeCIBA) {
+ 		grantProvider.cibaGrantHandler = newCIBAGrantHandler(cibaService, tokenBuilder, attrCacheService,
+diff --git a/backend/internal/oauth/oauth2/granthandlers/provider_test.go b/backend/internal/oauth/oauth2/granthandlers/provider_test.go
+index 97c354d0a..187cdf204 100644
+--- a/backend/internal/oauth/oauth2/granthandlers/provider_test.go
++++ b/backend/internal/oauth/oauth2/granthandlers/provider_test.go
+@@ -67,6 +67,7 @@ func (suite *GrantHandlerProviderTestSuite) SetupTest() {
+ 		suite.mockCIBAService,
+ 		revocationmock.NewRefreshTokenRevokerInterfaceMock(suite.T()),
+ 		revocationmock.NewCriteriaRevokerInterfaceMock(suite.T()),
++		nil,
+ 		testhelpers.OAuthConfig(),
+ 	)
+ }
+@@ -85,6 +86,7 @@ func (suite *GrantHandlerProviderTestSuite) TestNewGrantHandlerProvider() {
+ 		suite.mockCIBAService,
+ 		revocationmock.NewRefreshTokenRevokerInterfaceMock(suite.T()),
+ 		revocationmock.NewCriteriaRevokerInterfaceMock(suite.T()),
++		nil,
+ 		testhelpers.OAuthConfig(),
+ 	)
+ 	assert.NotNil(suite.T(), provider)
+diff --git a/backend/internal/oauth/oauth2/granthandlers/token_exchange.go b/backend/internal/oauth/oauth2/granthandlers/token_exchange.go
+index dcb343304..e89a6d996 100644
+--- a/backend/internal/oauth/oauth2/granthandlers/token_exchange.go
++++ b/backend/internal/oauth/oauth2/granthandlers/token_exchange.go
+@@ -9,6 +9,7 @@ import (
+ 	"slices"
+ 	"strings"
+ 
++	"github.com/thunder-id/thunderid/internal/attributecache"
+ 	oauthconfig "github.com/thunder-id/thunderid/internal/oauth/config"
+ 	"github.com/thunder-id/thunderid/internal/oauth/oauth2/constants"
+ 	"github.com/thunder-id/thunderid/internal/oauth/oauth2/dpop"
+@@ -24,12 +25,15 @@ import (
+ 
+ // tokenExchangeGrantHandler handles the token exchange grant type.
+ type tokenExchangeGrantHandler struct {
+-	tokenBuilder    tokenservice.TokenBuilderInterface
+-	tokenValidator  tokenservice.TokenValidatorInterface
+-	resourceService providers.ResourceServerProvider
+-	authzService    providers.AuthorizationProvider
+-	actorProvider   providers.ActorProvider
+-	cfg             oauthconfig.Config
++	tokenBuilder         tokenservice.TokenBuilderInterface
++	tokenValidator       tokenservice.TokenValidatorInterface
++	resourceService      providers.ResourceServerProvider
++	authzService         providers.AuthorizationProvider
++	actorProvider        providers.ActorProvider
++	cfg                  oauthconfig.Config
++	jwtService           jwt.JWTServiceInterface
++	attributeCache       attributecache.AttributeCacheServiceInterface
++	deviceSecretProvider providers.DeviceSecretProvider
+ }
+ 
+ // newTokenExchangeGrantHandler creates a new instance of tokenExchangeGrantHandler.
+@@ -40,14 +44,20 @@ func newTokenExchangeGrantHandler(
+ 	authzService providers.AuthorizationProvider,
+ 	actorProvider providers.ActorProvider,
+ 	cfg oauthconfig.Config,
++	jwtService jwt.JWTServiceInterface,
++	attributeCache attributecache.AttributeCacheServiceInterface,
++	deviceSecretProvider providers.DeviceSecretProvider,
+ ) GrantHandlerInterface {
+ 	return &tokenExchangeGrantHandler{
+-		tokenBuilder:    tokenBuilder,
+-		tokenValidator:  tokenValidator,
+-		resourceService: resourceService,
+-		authzService:    authzService,
+-		actorProvider:   actorProvider,
+-		cfg:             cfg,
++		tokenBuilder:         tokenBuilder,
++		tokenValidator:       tokenValidator,
++		resourceService:      resourceService,
++		authzService:         authzService,
++		actorProvider:        actorProvider,
++		cfg:                  cfg,
++		jwtService:           jwtService,
++		attributeCache:       attributeCache,
++		deviceSecretProvider: deviceSecretProvider,
+ 	}
+ }
+ 
+@@ -75,13 +85,22 @@ func (h *tokenExchangeGrantHandler) ValidateGrant(ctx context.Context, tokenRequ
+ 		}
+ 	}
+ 
+-	if !constants.TokenTypeIdentifier(tokenRequest.SubjectTokenType).IsValid() {
++	if !constants.TokenTypeIdentifier(tokenRequest.SubjectTokenType).IsValid() ||
++		constants.TokenTypeIdentifier(tokenRequest.SubjectTokenType) == constants.TokenTypeIdentifierDeviceSecret {
+ 		return &model.ErrorResponse{
+ 			Error:            constants.ErrorInvalidRequest,
+ 			ErrorDescription: "Unsupported subject_token_type",
+ 		}
+ 	}
+ 
++	// device_sso is only valid on the authorization request and the authorization_code grant.
++	if slices.Contains(strings.Fields(tokenRequest.Scope), constants.ScopeDeviceSSO) {
++		return &model.ErrorResponse{
++			Error:            constants.ErrorInvalidScope,
++			ErrorDescription: "The device_sso scope is not allowed on the token exchange grant",
++		}
++	}
++
+ 	if errResp := resourceindicators.ValidateResourceURIs(tokenRequest.Resources); errResp != nil {
+ 		return errResp
+ 	}
+@@ -108,6 +127,12 @@ func (h *tokenExchangeGrantHandler) ValidateGrant(ctx context.Context, tokenRequ
+ 		}
+ 	}
+ 
++	if constants.TokenTypeIdentifier(tokenRequest.ActorTokenType) == constants.TokenTypeIdentifierDeviceSecret {
++		if errResp := validateNativeSSORequest(tokenRequest); errResp != nil {
++			return errResp
++		}
++	}
++
+ 	if tokenRequest.RequestedTokenType != "" {
+ 		requestedType := constants.TokenTypeIdentifier(tokenRequest.RequestedTokenType)
+ 
+@@ -148,6 +173,11 @@ func (h *tokenExchangeGrantHandler) HandleGrant(ctx context.Context, tokenReques
+ 	*model.TokenResponseDTO, *model.ErrorResponse) {
+ 	logger := log.GetLogger().With(log.String(log.LoggerKeyComponentName, "TokenExchangeGrantHandler"))
+ 
++	// OpenID Connect Native SSO: an ID token plus a device secret signs the client in silently.
++	if constants.TokenTypeIdentifier(tokenRequest.ActorTokenType) == constants.TokenTypeIdentifierDeviceSecret {
++		return h.handleNativeSSOGrant(ctx, tokenRequest, oauthApp)
++	}
++
+ 	// An ID-JAG request (draft-ietf-oauth-identity-assertion-authz-grant) follows a distinct path:
+ 	// it exchanges a self-issued ID token for a JWT authorization grant targeted at an external
+ 	// resource authorization server, rather than issuing an access token.
+diff --git a/backend/internal/oauth/oauth2/granthandlers/token_exchange_test.go b/backend/internal/oauth/oauth2/granthandlers/token_exchange_test.go
+index ef62bf544..59af5f79b 100644
+--- a/backend/internal/oauth/oauth2/granthandlers/token_exchange_test.go
++++ b/backend/internal/oauth/oauth2/granthandlers/token_exchange_test.go
+@@ -232,7 +232,7 @@ func (suite *TokenExchangeGrantHandlerTestSuite) setupSuccessfulJWTMockWithScope
+ // TestNewTokenExchangeGrantHandler tests the constructor
+ func (suite *TokenExchangeGrantHandlerTestSuite) TestNewTokenExchangeGrantHandler() {
+ 	handler := newTokenExchangeGrantHandler(suite.mockTokenBuilder, suite.mockTokenValidator,
+-		suite.mockResourceService, nil, nil, oauthconfig.Config{})
++		suite.mockResourceService, nil, nil, oauthconfig.Config{}, nil, nil, nil)
+ 	assert.NotNil(suite.T(), handler)
+ 	assert.Implements(suite.T(), (*GrantHandlerInterface)(nil), handler)
+ }
+diff --git a/backend/internal/oauth/oauth2/model/token.go b/backend/internal/oauth/oauth2/model/token.go
+index 7a79fb0bb..511abeb24 100644
+--- a/backend/internal/oauth/oauth2/model/token.go
++++ b/backend/internal/oauth/oauth2/model/token.go
+@@ -36,6 +36,9 @@ type TokenResponse struct {
+ 	Scope           string `json:"scope,omitempty"`
+ 	IDToken         string `json:"id_token,omitempty"`
+ 	IssuedTokenType string `json:"issued_token_type,omitempty"`
++	// DeviceSecret is the OpenID Connect Native SSO device secret, returned only on an
++	// authorization_code grant whose code carries the device_sso scope.
++	DeviceSecret string `json:"device_secret,omitempty"`
+ }
+ 
+ // TokenDTO represents the data transfer object for tokens.
+@@ -63,4 +66,6 @@ type TokenResponseDTO struct {
+ 	AccessToken  TokenDTO
+ 	RefreshToken TokenDTO
+ 	IDToken      TokenDTO
++	// DeviceSecret is the OpenID Connect Native SSO device secret issued with this response, if any.
++	DeviceSecret string
+ }
+diff --git a/backend/internal/oauth/oauth2/token/service.go b/backend/internal/oauth/oauth2/token/service.go
+index 69b5aa717..45f453a25 100644
+--- a/backend/internal/oauth/oauth2/token/service.go
++++ b/backend/internal/oauth/oauth2/token/service.go
+@@ -238,6 +238,7 @@ func (ts *tokenService) ProcessTokenRequest(
+ 		RefreshToken: tokenRespDTO.RefreshToken.Token,
+ 		Scope:        scopes,
+ 		IDToken:      tokenRespDTO.IDToken.Token,
++		DeviceSecret: tokenRespDTO.DeviceSecret,
+ 	}
+ 
+ 	// For token exchange, determine the issued_token_type from the request.
+diff --git a/backend/internal/oauth/oauth2/tokenservice/builder.go b/backend/internal/oauth/oauth2/tokenservice/builder.go
+index f38cdfa4b..6559fbf19 100644
+--- a/backend/internal/oauth/oauth2/tokenservice/builder.go
++++ b/backend/internal/oauth/oauth2/tokenservice/builder.go
+@@ -446,6 +446,14 @@ func (tb *tokenBuilder) buildIDTokenClaims(ctx *IDTokenBuildContext) map[string]
+ 		claims["acr"] = ctx.CompletedACR
+ 	}
+ 
++	if ctx.SessionID != "" {
++		claims[constants.ClaimSessionID] = ctx.SessionID
++	}
++
++	if ctx.DeviceSecretHash != "" {
++		claims[constants.ClaimDeviceSecretHash] = ctx.DeviceSecretHash
++	}
++
+ 	userAttributes := ctx.UserAttributes
+ 	if userAttributes == nil {
+ 		userAttributes = make(map[string]interface{})
+diff --git a/backend/internal/oauth/oauth2/tokenservice/builder_test.go b/backend/internal/oauth/oauth2/tokenservice/builder_test.go
+index 90aca355f..9060e1012 100644
+--- a/backend/internal/oauth/oauth2/tokenservice/builder_test.go
++++ b/backend/internal/oauth/oauth2/tokenservice/builder_test.go
+@@ -2179,3 +2179,43 @@ func (suite *TokenBuilderTestSuite) TestBuildRefreshToken_MintsRTJWTTyp() {
+ 	assert.NotNil(suite.T(), result)
+ 	suite.mockJWTService.AssertExpectations(suite.T())
+ }
++
++func (suite *TokenBuilderTestSuite) TestBuildIDToken_NativeSSOClaims() {
++	ctx := &IDTokenBuildContext{
++		Subject:          "user123",
++		Audience:         "app123",
++		Scopes:           []string{"openid"},
++		OAuthApp:         suite.oauthApp,
++		SessionID:        "sid-1",
++		DeviceSecretHash: "ds-hash-1",
++	}
++	suite.mockJWTService.On("GenerateJWT", mock.Anything, "user123", "https://example.com", int64(3600),
++		mock.MatchedBy(func(claims map[string]interface{}) bool {
++			return claims["sid"] == "sid-1" && claims["ds_hash"] == "ds-hash-1"
++		}), mock.Anything, mock.Anything,
++	).Return(testIDToken, time.Now().Unix(), nil)
++
++	_, err := suite.builder.BuildIDToken(context.Background(), ctx)
++
++	assert.NoError(suite.T(), err)
++}
++
++func (suite *TokenBuilderTestSuite) TestBuildIDToken_NoNativeSSOClaimsByDefault() {
++	ctx := &IDTokenBuildContext{
++		Subject:  "user123",
++		Audience: "app123",
++		Scopes:   []string{"openid"},
++		OAuthApp: suite.oauthApp,
++	}
++	suite.mockJWTService.On("GenerateJWT", mock.Anything, "user123", "https://example.com", int64(3600),
++		mock.MatchedBy(func(claims map[string]interface{}) bool {
++			_, hasSID := claims["sid"]
++			_, hasDSHash := claims["ds_hash"]
++			return !hasSID && !hasDSHash
++		}), mock.Anything, mock.Anything,
++	).Return(testIDToken, time.Now().Unix(), nil)
++
++	_, err := suite.builder.BuildIDToken(context.Background(), ctx)
++
++	assert.NoError(suite.T(), err)
++}
+diff --git a/backend/internal/oauth/oauth2/tokenservice/model.go b/backend/internal/oauth/oauth2/tokenservice/model.go
+index a26ade149..8cddddb14 100644
+--- a/backend/internal/oauth/oauth2/tokenservice/model.go
++++ b/backend/internal/oauth/oauth2/tokenservice/model.go
+@@ -107,6 +107,10 @@ type IDTokenBuildContext struct {
+ 	ClaimsRequest  *oauth2model.ClaimsRequest
+ 	Nonce          string
+ 	CompletedACR   string
++	// SessionID, when set, is emitted as the OIDC sid claim.
++	SessionID string
++	// DeviceSecretHash, when set, is emitted as the OpenID Connect Native SSO ds_hash claim.
++	DeviceSecretHash string
+ }
+ 
+ // RefreshTokenClaims represents the validated claims from a refresh token.
+diff --git a/backend/internal/oauth/oauth2/utils/oauthutils.go b/backend/internal/oauth/oauth2/utils/oauthutils.go
+index f0ee90171..8d6dd9dc5 100644
+--- a/backend/internal/oauth/oauth2/utils/oauthutils.go
++++ b/backend/internal/oauth/oauth2/utils/oauthutils.go
+@@ -151,7 +151,9 @@ func SeparateOIDCAndNonOIDCScopes(scopes string, scopeClaimsMapping map[string][
+ 	for _, scp := range scopeSlice {
+ 		_, isMapped := scopeClaimsMapping[scp]
+ 		_, isStandard := constants.StandardOIDCScopes[scp]
+-		if isMapped || isStandard {
++		// device_sso is an OpenID Connect Native SSO protocol scope: it releases no claims and must
++		// not be bound to a resource server like a permission scope.
++		if isMapped || isStandard || scp == constants.ScopeDeviceSSO {
+ 			oidcScopes = append(oidcScopes, scp)
+ 		} else {
+ 			nonOidcScopes = append(nonOidcScopes, scp)
+diff --git a/backend/internal/oauth/oauth2/utils/oauthutils_test.go b/backend/internal/oauth/oauth2/utils/oauthutils_test.go
+index 2ef38bb08..674941aaa 100644
+--- a/backend/internal/oauth/oauth2/utils/oauthutils_test.go
++++ b/backend/internal/oauth/oauth2/utils/oauthutils_test.go
+@@ -1845,3 +1845,9 @@ func (suite *OAuth2UtilsTestSuite) TestSanitizeErrorDescriptionKeepsRedirectBuil
+ 	assert.NoError(suite.T(), err)
+ 	assert.Contains(suite.T(), uri, "error=access_denied")
+ }
++
++func (suite *OAuth2UtilsTestSuite) TestSeparateOIDCAndNonOIDCScopes_DeviceSSOIsOIDC() {
++	oidc, nonOIDC := SeparateOIDCAndNonOIDCScopes("openid device_sso read", map[string][]string{})
++	suite.Equal([]string{"openid", "device_sso"}, oidc)
++	suite.Equal([]string{"read"}, nonOIDC)
++}
+diff --git a/backend/pkg/thunderidengine/engine.go b/backend/pkg/thunderidengine/engine.go
+index ffe262348..92875a224 100644
+--- a/backend/pkg/thunderidengine/engine.go
++++ b/backend/pkg/thunderidengine/engine.go
+@@ -221,7 +221,7 @@ func New(mux *http.ServeMux, opts ...Option) *Engine {
+ 		engineCtx.jweService, engineCtx.flowExecService, engineCtx.observabilitySvc, engineCtx.runtimeCryptoSvc,
+ 		engineCtx.ouProvider, engineCtx.attributeCacheService, engineCtx.authzProvider, engineCtx.resourceProvider,
+ 		engineCtx.i18nProvider, engineCtx.idpProvider, engineCtx.dpopVerifier, engineCtx.runtimeStoreProvider,
+-		engineCtx.transactioner, revocationEnforcer, revocationService, oauthConfig)
++		engineCtx.transactioner, revocationEnforcer, revocationService, engineCtx.deviceSecretProvider, oauthConfig)
+ 	if err != nil {
+ 		logger.Fatal(ctx, "Failed to initialize OAuth services", log.Error(err))
+ 	}
+@@ -384,6 +384,7 @@ type engineContext struct {
+ 	authzProvider             providers.AuthorizationProvider
+ 	attestationProvider       providers.AttestationProvider
+ 	captchaValidationProvider providers.CaptchaValidationProvider
++	deviceSecretProvider      providers.DeviceSecretProvider
+ 
+ 	transactioner        providers.Transactioner
+ 	runtimeStoreProvider providers.RuntimeStoreProvider
+@@ -551,6 +552,12 @@ func WithLogConfig(config engineconfig.LogConfig) Option {
+ 	}
+ }
+ 
++// WithDeviceSecretProvider supplies the OpenID Connect Native SSO device secret provider. Optional:
++// without it the device_sso scope is rejected and device-secret token exchange is unavailable.
++func WithDeviceSecretProvider(provider providers.DeviceSecretProvider) Option {
++	return func(c *engineContext) { c.deviceSecretProvider = provider }
++}
++
+ // WithAttestationProvider supplies the Attestation provider.
+ func WithAttestationProvider(provider providers.AttestationProvider) Option {
+ 	return func(c *engineContext) { c.attestationProvider = provider }
+diff --git a/backend/pkg/thunderidengine/providers/constants.go b/backend/pkg/thunderidengine/providers/constants.go
+index 9c9ea00f2..eb43698da 100644
+--- a/backend/pkg/thunderidengine/providers/constants.go
++++ b/backend/pkg/thunderidengine/providers/constants.go
+@@ -573,3 +573,26 @@ const (
+ 	// ParamAPV is the raw (already base64url-decoded) ECDH-ES apv header value. Value type: []byte.
+ 	ParamAPV = "apv"
+ )
++
++// Device secret provider errors. DeviceSecretProvider implementations return (or wrap) these so the
++// engine can tell an invalid credential apart from an internal failure.
++var (
++	// ErrDeviceSecretInvalid indicates a malformed, undecryptable, unsigned, wrongly signed, wrongly
++	// issued or incomplete device secret.
++	ErrDeviceSecretInvalid = errors.New("DeviceSecretProvider: device secret is invalid")
++
++	// ErrDeviceSecretExpired indicates the device secret is past its expiry time.
++	ErrDeviceSecretExpired = errors.New("DeviceSecretProvider: device secret has expired")
++
++	// ErrDeviceSecretRevoked indicates the device secret or the session it belongs to was revoked
++	// or is no longer active.
++	ErrDeviceSecretRevoked = errors.New("DeviceSecretProvider: device secret or session is no longer active")
++
++	// ErrDeviceSecretClientNotPermitted indicates the requesting client may not redeem a device secret
++	// minted for the original client.
++	ErrDeviceSecretClientNotPermitted = errors.New(
++		"DeviceSecretProvider: client is not permitted to redeem this device secret")
++
++	// ErrDeviceSecretReplayed indicates the redemption was already recorded and may not be repeated.
++	ErrDeviceSecretReplayed = errors.New("DeviceSecretProvider: device secret was already redeemed")
++)
+diff --git a/backend/pkg/thunderidengine/providers/interface.go b/backend/pkg/thunderidengine/providers/interface.go
+index b852cf85b..09e074d84 100644
+--- a/backend/pkg/thunderidengine/providers/interface.go
++++ b/backend/pkg/thunderidengine/providers/interface.go
+@@ -290,3 +290,30 @@ type RuntimeCryptoProvider interface {
+ 	// GetSupportedEncryptionAlgorithms returns the list of algorithms supported by Encrypt and Decrypt.
+ 	GetSupportedEncryptionAlgorithms() []string
+ }
++
++// DeviceSecretProvider issues and validates OpenID Connect Native SSO device secrets
++// (https://openid.net/specs/openid-connect-native-sso-1_0.html). The device secret is opaque to
++// clients; the provider owns its format, protection (signing and encryption) and lifecycle.
++//
++// The engine calls GenerateDeviceSecret on the authorization_code grant when the authorization code
++// carries the device_sso scope, and ValidateDeviceSecret followed by MarkDeviceSecretUsed on the
++// token exchange grant when actor_token_type is urn:openid:params:token-type:device-secret.
++//
++// ValidateDeviceSecret and MarkDeviceSecretUsed must classify credential problems with the
++// ErrDeviceSecret* sentinel errors (wrapped or returned directly). Any other error is treated as an
++// internal failure and surfaced as server_error.
++type DeviceSecretProvider interface {
++	// GenerateDeviceSecret mints a device secret for the authenticated session described by req.
++	GenerateDeviceSecret(ctx context.Context, req *DeviceSecretRequest) (*DeviceSecret, error)
++
++	// ValidateDeviceSecret validates deviceSecret presented by requestingClientID and returns the
++	// authentication context it carries. It must verify integrity, issuer, expiry, required claims,
++	// revocation and session state, and that requestingClientID may redeem a secret minted for the
++	// original client.
++	ValidateDeviceSecret(ctx context.Context, requestingClientID, deviceSecret string) (
++		*DeviceSecretClaims, error)
++
++	// MarkDeviceSecretUsed records a successful redemption of the device secret by requestingClientID.
++	// It returns ErrDeviceSecretReplayed when the redemption policy forbids this redemption.
++	MarkDeviceSecretUsed(ctx context.Context, claims *DeviceSecretClaims, requestingClientID string) error
++}
+diff --git a/backend/pkg/thunderidengine/providers/model.go b/backend/pkg/thunderidengine/providers/model.go
+index 9d9714a4b..2634ef335 100644
+--- a/backend/pkg/thunderidengine/providers/model.go
++++ b/backend/pkg/thunderidengine/providers/model.go
+@@ -1532,3 +1532,52 @@ type PublicKeyInfo struct {
+ 	CertificateDER      []byte
+ 	CertificateChainDER [][]byte // leaf first, then intermediates; nil if not certificate-backed
+ }
++
++// DeviceSecretRequest is the authentication context a DeviceSecretProvider binds into a new device
++// secret.
++type DeviceSecretRequest struct {
++	// Subject is the authenticated user's subject identifier.
++	Subject string
++	// AuthID identifies the authentication session. It is also emitted as the ID token's sid claim.
++	AuthID string
++	// ClientID is the client the device secret is issued to (the Super App).
++	ClientID string
++	// Scopes are the scopes granted to ClientID, excluding device_sso.
++	Scopes []string
++	// ACR is the authentication context class reference satisfied by the login.
++	ACR string
++	// Claims are the user claims the user consented to release.
++	Claims []string
++	// AuthTime is the time the user authenticated (seconds since epoch).
++	AuthTime int64
++	// CnfJkt is the RFC 7638 thumbprint of the DPoP key the device secret is bound to.
++	CnfJkt string
++	// AttributeCacheID references the cached user attributes of the login, so tokens issued through
++	// the device secret can release the same consented claims. Empty when nothing was cached.
++	AttributeCacheID string
++}
++
++// DeviceSecret is a device secret minted by a DeviceSecretProvider.
++type DeviceSecret struct {
++	// Value is the opaque device secret returned to the client.
++	Value string
++	// ExpiresAt is the expiry time of the device secret (seconds since epoch).
++	ExpiresAt int64
++}
++
++// DeviceSecretClaims is the authentication context recovered from a validated device secret.
++type DeviceSecretClaims struct {
++	JTI              string
++	Issuer           string
++	Subject          string
++	AuthID           string
++	ClientID         string
++	Scopes           []string
++	ACR              string
++	Claims           []string
++	AuthTime         int64
++	CnfJkt           string
++	AttributeCacheID string
++	IssuedAt         int64
++	ExpiresAt        int64
++}
+diff --git a/backend/tests/mocks/devicesecretprovidermock/DeviceSecretProvider_mock.go b/backend/tests/mocks/devicesecretprovidermock/DeviceSecretProvider_mock.go
+new file mode 100644
+index 000000000..fdeba1f83
+--- /dev/null
++++ b/backend/tests/mocks/devicesecretprovidermock/DeviceSecretProvider_mock.go
+@@ -0,0 +1,244 @@
++// Code generated by mockery; DO NOT EDIT.
++// github.com/vektra/mockery
++// template: testify
++
++package devicesecretprovidermock
++
++import (
++	"context"
++
++	mock "github.com/stretchr/testify/mock"
++	"github.com/thunder-id/thunderid/pkg/thunderidengine/providers"
++)
++
++// NewDeviceSecretProviderMock creates a new instance of DeviceSecretProviderMock. It also registers a testing interface on the mock and a cleanup function to assert the mocks expectations.
++// The first argument is typically a *testing.T value.
++func NewDeviceSecretProviderMock(t interface {
++	mock.TestingT
++	Cleanup(func())
++}) *DeviceSecretProviderMock {
++	mock := &DeviceSecretProviderMock{}
++	mock.Mock.Test(t)
++
++	t.Cleanup(func() { mock.AssertExpectations(t) })
++
++	return mock
++}
++
++// DeviceSecretProviderMock is an autogenerated mock type for the DeviceSecretProvider type
++type DeviceSecretProviderMock struct {
++	mock.Mock
++}
++
++type DeviceSecretProviderMock_Expecter struct {
++	mock *mock.Mock
++}
++
++func (_m *DeviceSecretProviderMock) EXPECT() *DeviceSecretProviderMock_Expecter {
++	return &DeviceSecretProviderMock_Expecter{mock: &_m.Mock}
++}
++
++// GenerateDeviceSecret provides a mock function for the type DeviceSecretProviderMock
++func (_mock *DeviceSecretProviderMock) GenerateDeviceSecret(ctx context.Context, req *providers.DeviceSecretRequest) (*providers.DeviceSecret, error) {
++	ret := _mock.Called(ctx, req)
++
++	if len(ret) == 0 {
++		panic("no return value specified for GenerateDeviceSecret")
++	}
++
++	var r0 *providers.DeviceSecret
++	var r1 error
++	if returnFunc, ok := ret.Get(0).(func(context.Context, *providers.DeviceSecretRequest) (*providers.DeviceSecret, error)); ok {
++		return returnFunc(ctx, req)
++	}
++	if returnFunc, ok := ret.Get(0).(func(context.Context, *providers.DeviceSecretRequest) *providers.DeviceSecret); ok {
++		r0 = returnFunc(ctx, req)
++	} else {
++		if ret.Get(0) != nil {
++			r0 = ret.Get(0).(*providers.DeviceSecret)
++		}
++	}
++	if returnFunc, ok := ret.Get(1).(func(context.Context, *providers.DeviceSecretRequest) error); ok {
++		r1 = returnFunc(ctx, req)
++	} else {
++		r1 = ret.Error(1)
++	}
++	return r0, r1
++}
++
++// DeviceSecretProviderMock_GenerateDeviceSecret_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'GenerateDeviceSecret'
++type DeviceSecretProviderMock_GenerateDeviceSecret_Call struct {
++	*mock.Call
++}
++
++// GenerateDeviceSecret is a helper method to define mock.On call
++//   - ctx context.Context
++//   - req *providers.DeviceSecretRequest
++func (_e *DeviceSecretProviderMock_Expecter) GenerateDeviceSecret(ctx interface{}, req interface{}) *DeviceSecretProviderMock_GenerateDeviceSecret_Call {
++	return &DeviceSecretProviderMock_GenerateDeviceSecret_Call{Call: _e.mock.On("GenerateDeviceSecret", ctx, req)}
++}
++
++func (_c *DeviceSecretProviderMock_GenerateDeviceSecret_Call) Run(run func(ctx context.Context, req *providers.DeviceSecretRequest)) *DeviceSecretProviderMock_GenerateDeviceSecret_Call {
++	_c.Call.Run(func(args mock.Arguments) {
++		var arg0 context.Context
++		if args[0] != nil {
++			arg0 = args[0].(context.Context)
++		}
++		var arg1 *providers.DeviceSecretRequest
++		if args[1] != nil {
++			arg1 = args[1].(*providers.DeviceSecretRequest)
++		}
++		run(
++			arg0,
++			arg1,
++		)
++	})
++	return _c
++}
++
++func (_c *DeviceSecretProviderMock_GenerateDeviceSecret_Call) Return(deviceSecret *providers.DeviceSecret, err error) *DeviceSecretProviderMock_GenerateDeviceSecret_Call {
++	_c.Call.Return(deviceSecret, err)
++	return _c
++}
++
++func (_c *DeviceSecretProviderMock_GenerateDeviceSecret_Call) RunAndReturn(run func(ctx context.Context, req *providers.DeviceSecretRequest) (*providers.DeviceSecret, error)) *DeviceSecretProviderMock_GenerateDeviceSecret_Call {
++	_c.Call.Return(run)
++	return _c
++}
++
++// MarkDeviceSecretUsed provides a mock function for the type DeviceSecretProviderMock
++func (_mock *DeviceSecretProviderMock) MarkDeviceSecretUsed(ctx context.Context, claims *providers.DeviceSecretClaims, requestingClientID string) error {
++	ret := _mock.Called(ctx, claims, requestingClientID)
++
++	if len(ret) == 0 {
++		panic("no return value specified for MarkDeviceSecretUsed")
++	}
++
++	var r0 error
++	if returnFunc, ok := ret.Get(0).(func(context.Context, *providers.DeviceSecretClaims, string) error); ok {
++		r0 = returnFunc(ctx, claims, requestingClientID)
++	} else {
++		r0 = ret.Error(0)
++	}
++	return r0
++}
++
++// DeviceSecretProviderMock_MarkDeviceSecretUsed_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'MarkDeviceSecretUsed'
++type DeviceSecretProviderMock_MarkDeviceSecretUsed_Call struct {
++	*mock.Call
++}
++
++// MarkDeviceSecretUsed is a helper method to define mock.On call
++//   - ctx context.Context
++//   - claims *providers.DeviceSecretClaims
++//   - requestingClientID string
++func (_e *DeviceSecretProviderMock_Expecter) MarkDeviceSecretUsed(ctx interface{}, claims interface{}, requestingClientID interface{}) *DeviceSecretProviderMock_MarkDeviceSecretUsed_Call {
++	return &DeviceSecretProviderMock_MarkDeviceSecretUsed_Call{Call: _e.mock.On("MarkDeviceSecretUsed", ctx, claims, requestingClientID)}
++}
++
++func (_c *DeviceSecretProviderMock_MarkDeviceSecretUsed_Call) Run(run func(ctx context.Context, claims *providers.DeviceSecretClaims, requestingClientID string)) *DeviceSecretProviderMock_MarkDeviceSecretUsed_Call {
++	_c.Call.Run(func(args mock.Arguments) {
++		var arg0 context.Context
++		if args[0] != nil {
++			arg0 = args[0].(context.Context)
++		}
++		var arg1 *providers.DeviceSecretClaims
++		if args[1] != nil {
++			arg1 = args[1].(*providers.DeviceSecretClaims)
++		}
++		var arg2 string
++		if args[2] != nil {
++			arg2 = args[2].(string)
++		}
++		run(
++			arg0,
++			arg1,
++			arg2,
++		)
++	})
++	return _c
++}
++
++func (_c *DeviceSecretProviderMock_MarkDeviceSecretUsed_Call) Return(err error) *DeviceSecretProviderMock_MarkDeviceSecretUsed_Call {
++	_c.Call.Return(err)
++	return _c
++}
++
++func (_c *DeviceSecretProviderMock_MarkDeviceSecretUsed_Call) RunAndReturn(run func(ctx context.Context, claims *providers.DeviceSecretClaims, requestingClientID string) error) *DeviceSecretProviderMock_MarkDeviceSecretUsed_Call {
++	_c.Call.Return(run)
++	return _c
++}
++
++// ValidateDeviceSecret provides a mock function for the type DeviceSecretProviderMock
++func (_mock *DeviceSecretProviderMock) ValidateDeviceSecret(ctx context.Context, requestingClientID string, deviceSecret string) (*providers.DeviceSecretClaims, error) {
++	ret := _mock.Called(ctx, requestingClientID, deviceSecret)
++
++	if len(ret) == 0 {
++		panic("no return value specified for ValidateDeviceSecret")
++	}
++
++	var r0 *providers.DeviceSecretClaims
++	var r1 error
++	if returnFunc, ok := ret.Get(0).(func(context.Context, string, string) (*providers.DeviceSecretClaims, error)); ok {
++		return returnFunc(ctx, requestingClientID, deviceSecret)
++	}
++	if returnFunc, ok := ret.Get(0).(func(context.Context, string, string) *providers.DeviceSecretClaims); ok {
++		r0 = returnFunc(ctx, requestingClientID, deviceSecret)
++	} else {
++		if ret.Get(0) != nil {
++			r0 = ret.Get(0).(*providers.DeviceSecretClaims)
++		}
++	}
++	if returnFunc, ok := ret.Get(1).(func(context.Context, string, string) error); ok {
++		r1 = returnFunc(ctx, requestingClientID, deviceSecret)
++	} else {
++		r1 = ret.Error(1)
++	}
++	return r0, r1
++}
++
++// DeviceSecretProviderMock_ValidateDeviceSecret_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'ValidateDeviceSecret'
++type DeviceSecretProviderMock_ValidateDeviceSecret_Call struct {
++	*mock.Call
++}
++
++// ValidateDeviceSecret is a helper method to define mock.On call
++//   - ctx context.Context
++//   - requestingClientID string
++//   - deviceSecret string
++func (_e *DeviceSecretProviderMock_Expecter) ValidateDeviceSecret(ctx interface{}, requestingClientID interface{}, deviceSecret interface{}) *DeviceSecretProviderMock_ValidateDeviceSecret_Call {
++	return &DeviceSecretProviderMock_ValidateDeviceSecret_Call{Call: _e.mock.On("ValidateDeviceSecret", ctx, requestingClientID, deviceSecret)}
++}
++
++func (_c *DeviceSecretProviderMock_ValidateDeviceSecret_Call) Run(run func(ctx context.Context, requestingClientID string, deviceSecret string)) *DeviceSecretProviderMock_ValidateDeviceSecret_Call {
++	_c.Call.Run(func(args mock.Arguments) {
++		var arg0 context.Context
++		if args[0] != nil {
++			arg0 = args[0].(context.Context)
++		}
++		var arg1 string
++		if args[1] != nil {
++			arg1 = args[1].(string)
++		}
++		var arg2 string
++		if args[2] != nil {
++			arg2 = args[2].(string)
++		}
++		run(
++			arg0,
++			arg1,
++			arg2,
++		)
++	})
++	return _c
++}
++
++func (_c *DeviceSecretProviderMock_ValidateDeviceSecret_Call) Return(deviceSecretClaims *providers.DeviceSecretClaims, err error) *DeviceSecretProviderMock_ValidateDeviceSecret_Call {
++	_c.Call.Return(deviceSecretClaims, err)
++	return _c
++}
++
++func (_c *DeviceSecretProviderMock_ValidateDeviceSecret_Call) RunAndReturn(run func(ctx context.Context, requestingClientID string, deviceSecret string) (*providers.DeviceSecretClaims, error)) *DeviceSecretProviderMock_ValidateDeviceSecret_Call {
++	_c.Call.Return(run)
++	return _c
++}
