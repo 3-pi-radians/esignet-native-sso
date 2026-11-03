@@ -15,6 +15,18 @@ in eSignet Go on top of its FAPI 2.0 profile (PAR, PKCE, DPoP, `private_key_jwt`
 
 ---
 
+## Demo (Android 14 emulator)
+
+| 1. Super App signed in with eSignet | 2. Child App before sign-in | 3. Child App signed in silently |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/06-super-app-signed-in.png" width="240" alt="Super App signed in, Native SSO enabled"> | <img src="docs/screenshots/08-child-app-login.png" width="240" alt="Child App sign-in screen"> | <img src="docs/screenshots/09-child-app-silent-sso.png" width="240" alt="Child App signed in without UIN or OTP"> |
+| UIN + OTP login, `device_sso` granted, device secret stored encrypted | One tap on **Sign in** | No UIN, no OTP: same subject and session id, DPoP-bound token |
+
+| 4. Child App asks for more (phone) | 5. eSignet consent for the new claim | 6. After Super App sign-out |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/11-reconsent-prompt.png" width="240" alt="Re-consent prompt for the phone scope"> | <img src="docs/screenshots/13-reconsent-esignet-consent.png" width="240" alt="eSignet consent screen listing Phone Number"> | <img src="docs/screenshots/15-child-after-super-signout.png" width="240" alt="Child App asks the user to sign in to the Super App first"> |
+| `interaction_required`: the user decides | Bonus task: re-consent on eSignet's own screen | Sibling sign-in stops until the user logs in again |
+
 ## How it works
 
 ```mermaid
