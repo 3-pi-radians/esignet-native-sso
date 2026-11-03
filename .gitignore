@@ -16,3 +16,6 @@ demo/.run/
 .DS_Store
 .idea/
 .vscode/
+
+# Submission documents for Google Drive (not part of the source repo)
+/deliverables/
