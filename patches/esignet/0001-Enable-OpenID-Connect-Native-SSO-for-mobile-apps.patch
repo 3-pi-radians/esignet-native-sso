@@ -1,7 +1,7 @@
 From 3dbc7d44928059947d8cd2cb2dc43595b4e4f95b Mon Sep 17 00:00:00 2001
 From: Pankaj Deopa <47059657+3-pi-radians@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 00:25:21 +0530
-Subject: [PATCH] Enable OpenID Connect Native SSO for mobile apps
+Subject: [PATCH 1/2] Enable OpenID Connect Native SSO for mobile apps
 
 - Implement the ThunderID DeviceSecretProvider: device secrets are JWTs
   (iss, aud, sub, jti, iat, nbf, exp, auth_id, client_id, scope, acr,

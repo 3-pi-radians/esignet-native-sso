@@ -88,8 +88,11 @@ if [ "${SKIP_UI:-}" = "" ]; then
   # this local run, poll a same-origin file instead (stop.sh restores env-config.js).
   ENV_JS="$ROOT/esignet/oidc-ui/public/env-config.js"
   grep -q "POLLING_URL" "$ENV_JS" || echo "window._env_.POLLING_URL = '/favicon.ico';" >>"$ENV_JS"
-  (cd "$ROOT/esignet/oidc-ui" && VITE_API_URL="http://localhost:$ESIGNET_PORT" nohup npx vite --port 3000 --strictPort </dev/null \
-    >"$RUN/oidc-ui.log" 2>&1 & echo $! >"$RUN/oidc-ui.pid")
+  # Redirect the whole background group, not just vite: otherwise the subshell keeps this script's
+  # stdout open and `start.sh | tail` never returns.
+  (cd "$ROOT/esignet/oidc-ui" && VITE_API_URL="http://localhost:$ESIGNET_PORT" \
+    exec npx vite --port 3000 --strictPort) </dev/null >"$RUN/oidc-ui.log" 2>&1 &
+  echo $! >"$RUN/oidc-ui.pid"
   wait_for "http://localhost:3000/" oidc-ui
 fi
 echo "Ready. Discovery: $MOSIP_ESIGNET_HOST/.well-known/openid-configuration"
