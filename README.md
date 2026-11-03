@@ -1,6 +1,6 @@
 # Native SSO for eSignet Go
 
-**MOSIP Decode 2026 · Problem statement 03: Enable Native SSO in eSignet Go for Mobile Apps **
+**MOSIP Decode 2026 · Problem statement 03: Enable Native SSO in eSignet Go for Mobile Apps**
 
 Sign in once in a vendor's **Super App** with eSignet (UIN + OTP), and every other app from the same vendor
 on that device (**Child App**) signs in **silently**, with no UIN, no OTP and no consent screen. This
